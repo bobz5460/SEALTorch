@@ -2,6 +2,7 @@
 #include <SEALTorch/math.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <fstream>
@@ -12,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/resource.h>
 #include <algorithm>
 #include <utility>
 #include <vector>
@@ -207,11 +209,18 @@ int main(int argc, char **argv)
         seal::Plaintext encoded; encoder.encode(input, scale, encoded); seal::Ciphertext encrypted; encryptor.encrypt_symmetric(encoded, encrypted);
         std::vector<seal::Ciphertext> encrypted_values{std::move(encrypted)};
         std::vector<TraceLayer> traces;
+        double plaintext_ms = 0.0;
+        double encrypted_ms = 0.0;
 
         for (std::size_t index = 0; index < model.layers.size(); ++index) {
             const auto &layer = model.layers[index];
             TraceLayer trace;
+            const auto plaintext_start = std::chrono::steady_clock::now();
             trace.plaintext_pre = plaintext_layer(layer, plaintext);
+            const auto plaintext_end = std::chrono::steady_clock::now();
+            plaintext_ms += std::chrono::duration<double, std::milli>(plaintext_end - plaintext_start).count();
+
+            const auto encrypted_start = std::chrono::steady_clock::now();
             encrypted_values = encrypted_layer(layer, encrypted_values, evaluator, relin_keys, galois_keys, encoder, scale, max_concurrency);
             trace.ckks_pre = decrypt(encrypted_values, decryptor, encoder);
             trace.plaintext_post = trace.plaintext_pre;
@@ -221,11 +230,19 @@ int main(int argc, char **argv)
                 for (auto &value : encrypted_values) value = sealtorch::approximate_gelu(evaluator, relin_keys, encoder, value, scale);
                 trace.ckks_post = decrypt(encrypted_values, decryptor, encoder);
             }
+            const auto encrypted_end = std::chrono::steady_clock::now();
+            encrypted_ms += std::chrono::duration<double, std::milli>(encrypted_end - encrypted_start).count();
             plaintext = trace.plaintext_post;
             traces.push_back(std::move(trace));
         }
 
-        std::cout << "{\"layers\":[";
+        struct rusage usage{};
+        getrusage(RUSAGE_SELF, &usage);
+        const double peak_memory_mb = static_cast<double>(usage.ru_maxrss) / 1024.0;
+        std::cout << "{\"metrics\":{";
+        std::cout << "\"plaintext_ms\":" << plaintext_ms;
+        std::cout << ",\"encrypted_ms\":" << encrypted_ms;
+        std::cout << ",\"peak_memory_mb\":" << peak_memory_mb << "},\"layers\":[";
         for (std::size_t index = 0; index < traces.size(); ++index) {
             if (index) std::cout << ',';
             const auto &trace = traces[index];

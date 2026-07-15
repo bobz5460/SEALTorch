@@ -31,6 +31,14 @@
     th:first-child,td:first-child { text-align:left; } td.error { color:var(--red); } td.good { color:var(--green); }
     .bar { height:8px; background:#2a3340; border-radius:5px; overflow:hidden; min-width:100px; }
     .bar i { display:block; height:100%; background:var(--blue); }
+    .charts { display:grid; grid-template-columns:repeat(2,minmax(280px,1fr)); gap:12px; margin-top:18px; }
+    .chart { min-height:160px; } .chart h2 { margin-bottom:8px; }
+    .bar-row { display:grid; grid-template-columns:115px 1fr 62px; gap:8px; align-items:center; margin:8px 0; color:var(--muted); font-size:12px; }
+    .bar-row strong { color:var(--text); text-align:right; font-variant-numeric:tabular-nums; }
+    .bar-track { height:12px; background:#2a3340; border-radius:6px; overflow:hidden; }
+    .bar-track i { display:block; height:100%; min-width:1px; border-radius:6px; background:var(--blue); }
+    .bar-track i.green { background:var(--green); } .bar-track i.red { background:var(--red); }
+    select { background:#252d39; border:1px solid #455064; color:var(--text); border-radius:6px; padding:8px; }
     .hint { color:var(--muted); font-size:12px; margin-top:10px; }
     @media (max-width:800px) { .top { grid-template-columns:1fr; } .summary { grid-template-columns:repeat(2,1fr); } }
   </style>
@@ -43,7 +51,7 @@
     <div class="panel">
       <h2>Input</h2>
       <canvas id="canvas" width="280" height="280"></canvas>
-      <div class="controls"><button id="run">Run comparison</button><button class="secondary" id="clear">Clear</button></div>
+      <div class="controls"><button id="run">Run comparison</button><button class="secondary" id="clear">Clear</button><select id="expected" title="Optional ground-truth digit"><option value="">Expected: —</option><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option></select></div>
       <div id="status">Ready.</div>
       <div class="hint">The browser samples this canvas into 28×28 normalized pixels.</div>
     </div>
@@ -58,6 +66,12 @@
       <p class="hint">Pre values are before activation. Post values compare the new JSON model's plaintext ApproximateGELU with its encrypted CKKS evaluation.</p>
     </div>
   </section>
+  <section class="charts" id="charts" hidden>
+    <div class="panel chart"><h2>Prediction comparison</h2><div id="prediction-chart"></div></div>
+    <div class="panel chart"><h2>Runtime and memory</h2><div id="runtime-chart"></div></div>
+    <div class="panel chart"><h2>Output confidence</h2><div id="confidence-chart"></div></div>
+    <div class="panel chart"><h2>Error by layer</h2><div id="error-chart"></div></div>
+  </section>
   <div id="layers"></div>
 </main>
 <script>
@@ -69,7 +83,7 @@ function ink(e) { const [x,y]=point(e); ctx.lineTo(x,y); ctx.stroke(); }
 canvas.addEventListener('pointerdown', e => { drawing=true; canvas.setPointerCapture(e.pointerId); const [x,y]=point(e); ctx.beginPath(); ctx.moveTo(x,y); ink(e); });
 canvas.addEventListener('pointermove', e => { if(drawing) ink(e); });
 canvas.addEventListener('pointerup', () => drawing=false); canvas.addEventListener('pointercancel', () => drawing=false);
-document.getElementById('clear').onclick=()=>{ctx.fillStyle='#000';ctx.fillRect(0,0,280,280);ctx.strokeStyle='#fff';document.getElementById('layers').innerHTML='';document.getElementById('status').textContent='Ready.';};
+document.getElementById('clear').onclick=()=>{ctx.fillStyle='#000';ctx.fillRect(0,0,280,280);ctx.strokeStyle='#fff';document.getElementById('layers').innerHTML='';document.getElementById('charts').hidden=true;document.getElementById('status').textContent='Ready.';};
 function pixels() {
   const data=ctx.getImageData(0,0,280,280).data, result=[];
   for(let y=0;y<28;y++) for(let x=0;x<28;x++) { let sum=0; for(let dy=0;dy<10;dy++) for(let dx=0;dx<10;dx++) sum+=data[((y*10+dy)*280+x*10+dx)*4]; result.push(sum/(100*255)); }
@@ -83,13 +97,24 @@ function layerTable(layer, index) {
   return `<section class="panel layer"><div class="layer-head"><h2>Layer ${index+1} (${n} neurons)</h2><span>post max error ${fmt(max)} · mean error ${fmt(mean)}</span></div><div class="table-wrap"><table><thead><tr><th>Neuron</th><th>Plain pre</th><th>CKKS pre</th><th>Plain post</th><th>CKKS post</th><th>|post error|</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
 }
 function softmax(a) { const m=Math.max(...a), e=a.map(x=>Math.exp(x-m)), s=e.reduce((x,y)=>x+y,0); return e.map(x=>x/s); }
+function bar(label, value, width, className='') { return `<div class="bar-row"><span>${label}</span><div class="bar-track"><i class="${className}" style="width:${Math.max(0,Math.min(100,width))}%"></i></div><strong>${value}</strong></div>`; }
+function renderCharts(result, plain, ckks, plainPred, ckksPred) {
+  const metrics=result.metrics||{}, agreement=plainPred===ckksPred, expected=document.getElementById('expected').value;
+  const accuracy=expected===''?'—':(Number(expected)===plainPred?'100%':'0%');
+  document.getElementById('prediction-chart').innerHTML=bar('Agreement',agreement?'100%':'0%',agreement?100:0,agreement?'green':'red')+bar('Sample accuracy',accuracy,expected===''?0:Number(expected)===plainPred?100:0,expected===''?'':'green');
+  const maxTime=Math.max(Number(metrics.plaintext_ms)||0,Number(metrics.encrypted_ms)||0,1);
+  document.getElementById('runtime-chart').innerHTML=bar('Plaintext',`${fmt(metrics.plaintext_ms||0)} ms`,100*(metrics.plaintext_ms||0)/maxTime)+bar('Encrypted',`${fmt(metrics.encrypted_ms||0)} ms`,100*(metrics.encrypted_ms||0)/maxTime,'green')+`<div class="hint">Peak memory: ${fmt(metrics.peak_memory_mb||0)} MB</div>`;
+  let confidence=''; for(let i=0;i<10;i++) { const p=Math.max(plain[i],ckks[i]); confidence+=bar(`${i} plain / CKKS`,`${(plain[i]*100).toFixed(1)} / ${(ckks[i]*100).toFixed(1)}%`,p*100,i===plainPred?'green':''); } document.getElementById('confidence-chart').innerHTML=confidence;
+  const layerErrors=result.layers.map(l=>{const e=l.plaintext_post.map((x,i)=>Math.abs(x-l.ckks_post[i]));return {max:Math.max(...e),mean:e.reduce((a,b)=>a+b,0)/e.length};}), maxLayer=Math.max(...layerErrors.map(x=>x.max),1); document.getElementById('error-chart').innerHTML=layerErrors.map((e,i)=>bar(`Layer ${i+1}`,`${fmt(e.max)} max`,e.max/maxLayer*100,e.max>.05?'red':'')).join('');
+  document.getElementById('charts').hidden=false;
+}
 document.getElementById('run').onclick=async()=>{
   const button=document.getElementById('run'), status=document.getElementById('status'); button.disabled=true; status.textContent='Running plaintext and CKKS trace; this may take a minute...';
   try { const response=await fetch('/trace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pixels())}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'trace failed');
     const last=result.layers[result.layers.length-1], plain=softmax(last.plaintext_post), ckks=softmax(last.ckks_post);
-    document.getElementById('plain-pred').textContent=plain.indexOf(Math.max(...plain)); document.getElementById('ckks-pred').textContent=ckks.indexOf(Math.max(...ckks));
+    const plainPred=plain.indexOf(Math.max(...plain)), ckksPred=ckks.indexOf(Math.max(...ckks)); document.getElementById('plain-pred').textContent=plainPred; document.getElementById('ckks-pred').textContent=ckksPred;
     const errors=result.layers.flatMap(l=>l.plaintext_post.map((x,i)=>Math.abs(x-l.ckks_post[i]))); document.getElementById('max-error').textContent=fmt(Math.max(...errors)); document.getElementById('mean-error').textContent=fmt(errors.reduce((a,b)=>a+b,0)/errors.length);
-    document.getElementById('layers').innerHTML=result.layers.map(layerTable).join(''); status.textContent='Complete.';
+    renderCharts(result,plain,ckks,plainPred,ckksPred); document.getElementById('layers').innerHTML=result.layers.map(layerTable).join(''); status.textContent='Complete.';
   } catch(error) { status.textContent='Error: '+error.message; } finally { button.disabled=false; }
 };
 </script>
