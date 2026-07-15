@@ -15,7 +15,8 @@ namespace
         double bias,
         const seal::Evaluator &evaluator,
         seal::CKKSEncoder &encoder,
-        double scale)
+        double scale,
+        bool rescale_result)
     {
         std::vector<seal::Plaintext> encoded_weights(weights.size());
         for (std::size_t index = 0; index < weights.size(); ++index)
@@ -32,7 +33,7 @@ namespace
         }
 
         auto result = sealtorch::encrypted_dot_product(evaluator, encoded_weights, input);
-        evaluator.rescale_to_next_inplace(result);
+        if (rescale_result) evaluator.rescale_to_next_inplace(result);
 
         seal::Plaintext encoded_bias;
         encoder.encode(bias, result.scale(), encoded_bias);
@@ -81,7 +82,8 @@ namespace sealtorch
             for (int output = 0; output < output_width; output++)
             {
                 next.push_back(evaluate_neuron(
-                    model_.layers[layer].weights[output], values, model_.layers[layer].biases[output], evaluator, encoder, scale));
+                    model_.layers[layer].weights[output], values, model_.layers[layer].biases[output], evaluator, encoder, scale,
+                    layer + 1 != model_.layers.size()));
                 if (progress) {
                     const auto layer_completed = static_cast<std::size_t>(output + 1);
                     progress({++completed, total, static_cast<std::size_t>(layer),
