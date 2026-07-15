@@ -3,11 +3,36 @@
 #include "math.h"
 
 #include <limits>
+#include <algorithm>
+#include <future>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace
 {
+    template <typename Function>
+    auto parallel_neurons(std::size_t count, std::size_t max_concurrency, Function function)
+        -> std::vector<std::invoke_result_t<Function, std::size_t>>
+    {
+        using Result = std::invoke_result_t<Function, std::size_t>;
+        std::vector<Result> results(count);
+        if (count == 0) return results;
+
+        const std::size_t workers = std::max<std::size_t>(
+            1, std::min(count, max_concurrency == 0 ? 1 : max_concurrency));
+        for (std::size_t start = 0; start < count; start += workers)
+        {
+            const std::size_t end = std::min(count, start + workers);
+            std::vector<std::future<Result>> futures;
+            futures.reserve(end - start);
+            for (std::size_t index = start; index < end; ++index)
+                futures.emplace_back(std::async(std::launch::async, function, index));
+            for (std::size_t offset = 0; offset < futures.size(); ++offset)
+                results[start + offset] = futures[offset].get();
+        }
+        return results;
+    }
 
     seal::Ciphertext evaluate_neuron(
         const std::vector<double> &weights,
@@ -76,7 +101,8 @@ namespace
 
 namespace sealtorch
 {
-    Evaluator::Evaluator(NeuralNetwork model)
+    Evaluator::Evaluator(NeuralNetwork model, std::size_t max_concurrency)
+        : max_concurrency_(max_concurrency == 0 ? 1 : max_concurrency)
     {
         set_model(std::move(model));
     }
@@ -89,6 +115,16 @@ namespace sealtorch
     const NeuralNetwork &Evaluator::model() const
     {
         return model_;
+    }
+
+    void Evaluator::set_max_concurrency(std::size_t max_concurrency)
+    {
+        max_concurrency_ = max_concurrency == 0 ? 1 : max_concurrency;
+    }
+
+    std::size_t Evaluator::max_concurrency() const
+    {
+        return max_concurrency_;
     }
 
     std::vector<seal::Ciphertext> Evaluator::predict(
@@ -109,26 +145,18 @@ namespace sealtorch
         for (int layer = 0; layer < model_.layers.size(); layer++)
         {
             const auto output_width = model_.layers[layer].output_size;
-            std::vector<seal::Ciphertext> next;
-            next.reserve(output_width);
+            const auto &current_layer = model_.layers[layer];
+            auto next = parallel_neurons(static_cast<std::size_t>(output_width), max_concurrency_,
+                [&](std::size_t output) {
+                    if (layer == 0)
+                        return evaluate_neuron(current_layer.weights[output], input.front(),
+                            current_layer.biases[output], evaluator, galois_keys, encoder, scale);
+                    return evaluate_scalar_neuron(current_layer.weights[output], values,
+                        current_layer.biases[output], evaluator, encoder, scale);
+                });
 
-            for (int output = 0; output < output_width; output++)
+            for (int output = 0; output < output_width; ++output)
             {
-                if (layer == 0)
-                {
-                    next.push_back(evaluate_neuron(
-                        model_.layers[layer].weights[output], input.front(),
-                        model_.layers[layer].biases[output], evaluator,
-                        galois_keys, encoder, scale));
-                }
-                else
-                {
-                    next.push_back(evaluate_scalar_neuron(
-                        model_.layers[layer].weights[output], values,
-                        model_.layers[layer].biases[output], evaluator,
-                        encoder, scale));
-                }
-
                 ++completed;
                 if (progress) {
                     progress({"evaluating encrypted layer", static_cast<std::size_t>(layer + 1), model_.layers.size(),

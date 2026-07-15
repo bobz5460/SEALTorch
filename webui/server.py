@@ -37,7 +37,7 @@ class Handler(BaseHTTPRequestHandler):
             if not TRACE.exists():
                 raise RuntimeError("build/sealtorch_trace does not exist; run cmake --build build first")
             completed = subprocess.run(
-                [str(TRACE), str(MODEL)],
+                [str(TRACE), str(MODEL), "--threads", str(self.server.max_concurrency)],
                 input=" ".join(str(float(value)) for value in values) + "\n",
                 text=True,
                 capture_output=True,
@@ -63,9 +63,11 @@ if __name__ == "__main__":
         help="interface to bind (use 0.0.0.0 for a cloud/container port forward)",
     )
     parser.add_argument("--port", type=int, default=8000, help="HTTP port")
+    parser.add_argument("--threads", type=int, default=4, help="maximum concurrent neurons per layer")
     args = parser.parse_args()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.max_concurrency = max(1, args.threads)
     display_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
     print(f"SEALTorch trace UI: http://{display_host}:{args.port}")
     server.serve_forever()

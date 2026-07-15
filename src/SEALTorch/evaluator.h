@@ -23,11 +23,14 @@ namespace sealtorch
     class Evaluator
     {
     public:
-        explicit Evaluator(NeuralNetwork model);
+        explicit Evaluator(NeuralNetwork model, std::size_t max_concurrency = 4);
 
         void set_model(NeuralNetwork model);
 
         const NeuralNetwork &model() const;
+
+        void set_max_concurrency(std::size_t max_concurrency);
+        std::size_t max_concurrency() const;
 
         std::vector<seal::Ciphertext> predict(
             const std::vector<seal::Ciphertext> &input,
@@ -40,5 +43,6 @@ namespace sealtorch
 
     private:
         NeuralNetwork model_;
+        std::size_t max_concurrency_;
     };
 }

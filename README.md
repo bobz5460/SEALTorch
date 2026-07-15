@@ -14,6 +14,13 @@ cmake --build build
 python3 webui/server.py
 ```
 
+The dashboard evaluates neurons in each layer concurrently, with four worker
+threads by default. Configure the cap when starting it:
+
+```sh
+python3 webui/server.py --threads 2
+```
+
 Open <http://127.0.0.1:8000>. Draw a digit and click **Run comparison**. The
  dashboard uses `src/mnist_mlp_gelu.json` and shows plaintext and CKKS
  pre-activation values, post-activation values, and absolute error for every
