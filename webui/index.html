@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SEALTorch CKKS Trace</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101318; --panel:#191e27; --line:#303846; --text:#eef2f7; --muted:#9ba7b7; --blue:#4b8bff; --green:#35d07f; --red:#ff7777; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui,sans-serif; }
+    main { max-width:1500px; margin:0 auto; padding:22px; }
+    h1 { margin:0 0 5px; font-size:24px; } h2 { margin:0 0 12px; font-size:17px; }
+    .subtitle { color:var(--muted); margin-bottom:18px; }
+    .top { display:grid; grid-template-columns:310px 1fr; gap:18px; align-items:start; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+    canvas { display:block; width:280px; height:280px; background:#000; border:1px solid #455064; image-rendering:pixelated; cursor:crosshair; }
+    button { border:0; border-radius:6px; color:#fff; background:var(--blue); padding:9px 14px; cursor:pointer; font-weight:600; }
+    button.secondary { background:#394352; } button:disabled { opacity:.5; cursor:wait; }
+    .controls { display:flex; gap:8px; margin-top:12px; }
+    #status { color:var(--muted); margin-top:11px; min-height:22px; }
+    .summary { display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:10px; }
+    .metric { border:1px solid var(--line); border-radius:7px; padding:10px; }
+    .metric label { display:block; color:var(--muted); font-size:12px; } .metric strong { font-size:18px; }
+    .layer { margin-top:18px; }
+    .layer-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    .layer-head span { color:var(--muted); font-size:12px; }
+    .table-wrap { overflow:auto; max-height:430px; border:1px solid var(--line); border-radius:7px; }
+    table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+    th,td { padding:6px 9px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+    th { position:sticky; top:0; background:#222a36; color:var(--muted); font-weight:600; }
+    th:first-child,td:first-child { text-align:left; } td.error { color:var(--red); } td.good { color:var(--green); }
+    .bar { height:8px; background:#2a3340; border-radius:5px; overflow:hidden; min-width:100px; }
+    .bar i { display:block; height:100%; background:var(--blue); }
+    .hint { color:var(--muted); font-size:12px; margin-top:10px; }
+    @media (max-width:800px) { .top { grid-template-columns:1fr; } .summary { grid-template-columns:repeat(2,1fr); } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>SEALTorch CKKS trace</h1>
+  <div class="subtitle">Draw a digit, then compare every neuron’s plaintext and encrypted values.</div>
+  <section class="top">
+    <div class="panel">
+      <h2>Input</h2>
+      <canvas id="canvas" width="280" height="280"></canvas>
+      <div class="controls"><button id="run">Run comparison</button><button class="secondary" id="clear">Clear</button></div>
+      <div id="status">Ready.</div>
+      <div class="hint">The browser samples this canvas into 28×28 normalized pixels.</div>
+    </div>
+    <div class="panel">
+      <h2>Overall comparison</h2>
+      <div class="summary">
+        <div class="metric"><label>Plaintext prediction</label><strong id="plain-pred">—</strong></div>
+        <div class="metric"><label>CKKS prediction</label><strong id="ckks-pred">—</strong></div>
+        <div class="metric"><label>Largest post-activation error</label><strong id="max-error">—</strong></div>
+        <div class="metric"><label>Mean post-activation error</label><strong id="mean-error">—</strong></div>
+      </div>
+      <p class="hint">Pre values are before activation. Post values compare the new JSON model's plaintext ApproximateGELU with its encrypted CKKS evaluation.</p>
+    </div>
+  </section>
+  <div id="layers"></div>
+</main>
+<script>
+const canvas = document.getElementById('canvas'), ctx = canvas.getContext('2d');
+ctx.fillStyle = '#000'; ctx.fillRect(0,0,280,280); ctx.strokeStyle='#fff'; ctx.lineWidth=18; ctx.lineCap='round';
+let drawing = false;
+function point(e) { const r=canvas.getBoundingClientRect(); return [(e.clientX-r.left)*280/r.width,(e.clientY-r.top)*280/r.height]; }
+function ink(e) { const [x,y]=point(e); ctx.lineTo(x,y); ctx.stroke(); }
+canvas.addEventListener('pointerdown', e => { drawing=true; canvas.setPointerCapture(e.pointerId); const [x,y]=point(e); ctx.beginPath(); ctx.moveTo(x,y); ink(e); });
+canvas.addEventListener('pointermove', e => { if(drawing) ink(e); });
+canvas.addEventListener('pointerup', () => drawing=false); canvas.addEventListener('pointercancel', () => drawing=false);
+document.getElementById('clear').onclick=()=>{ctx.fillStyle='#000';ctx.fillRect(0,0,280,280);ctx.strokeStyle='#fff';document.getElementById('layers').innerHTML='';document.getElementById('status').textContent='Ready.';};
+function pixels() {
+  const data=ctx.getImageData(0,0,280,280).data, result=[];
+  for(let y=0;y<28;y++) for(let x=0;x<28;x++) { let sum=0; for(let dy=0;dy<10;dy++) for(let dx=0;dx<10;dx++) sum+=data[((y*10+dy)*280+x*10+dx)*4]; result.push(sum/(100*255)); }
+  return result;
+}
+function fmt(x) { return Number(x).toFixed(7); }
+function layerTable(layer, index) {
+  const n=layer.plaintext_pre.length, errors=layer.plaintext_post.map((x,i)=>Math.abs(x-layer.ckks_post[i]));
+  const max=Math.max(...errors), mean=errors.reduce((a,b)=>a+b,0)/errors.length;
+  let rows=''; for(let i=0;i<n;i++) rows+=`<tr><td>${i}</td><td>${fmt(layer.plaintext_pre[i])}</td><td>${fmt(layer.ckks_pre[i])}</td><td>${fmt(layer.plaintext_post[i])}</td><td>${fmt(layer.ckks_post[i])}</td><td class="${errors[i] > .05 ? 'error':'good'}">${fmt(errors[i])}</td></tr>`;
+  return `<section class="panel layer"><div class="layer-head"><h2>Layer ${index+1} (${n} neurons)</h2><span>post max error ${fmt(max)} · mean error ${fmt(mean)}</span></div><div class="table-wrap"><table><thead><tr><th>Neuron</th><th>Plain pre</th><th>CKKS pre</th><th>Plain post</th><th>CKKS post</th><th>|post error|</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+}
+function softmax(a) { const m=Math.max(...a), e=a.map(x=>Math.exp(x-m)), s=e.reduce((x,y)=>x+y,0); return e.map(x=>x/s); }
+document.getElementById('run').onclick=async()=>{
+  const button=document.getElementById('run'), status=document.getElementById('status'); button.disabled=true; status.textContent='Running plaintext and CKKS trace; this may take a minute...';
+  try { const response=await fetch('/trace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pixels())}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'trace failed');
+    const last=result.layers[result.layers.length-1], plain=softmax(last.plaintext_post), ckks=softmax(last.ckks_post);
+    document.getElementById('plain-pred').textContent=plain.indexOf(Math.max(...plain)); document.getElementById('ckks-pred').textContent=ckks.indexOf(Math.max(...ckks));
+    const errors=result.layers.flatMap(l=>l.plaintext_post.map((x,i)=>Math.abs(x-l.ckks_post[i]))); document.getElementById('max-error').textContent=fmt(Math.max(...errors)); document.getElementById('mean-error').textContent=fmt(errors.reduce((a,b)=>a+b,0)/errors.length);
+    document.getElementById('layers').innerHTML=result.layers.map(layerTable).join(''); status.textContent='Complete.';
+  } catch(error) { status.textContent='Error: '+error.message; } finally { button.disabled=false; }
+};
+</script>
+</body>
+</html>

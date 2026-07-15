@@ -2,26 +2,31 @@
 
 #include <seal/seal.h>
 
+#include <cstddef>
 #include <vector>
 
 namespace sealtorch
 {
     seal::Ciphertext encrypted_dot_product(
         const seal::Evaluator& evaluator,
-        std::vector<seal::Plaintext>& weights,
-        const std::vector<seal::Ciphertext>& input);
+        const seal::GaloisKeys& galois_keys,
+        const seal::Plaintext& weights,
+        const seal::Ciphertext& input,
+        std::size_t input_width);
 
-    // Polynomial approximation of GELU. This is the degree-four Maclaurin
-    // approximation of x * Phi(x), and is suitable for bounded CKKS inputs:
+    // Degree-four polynomial approximation of ReLU, exposed under the legacy
+    // approximate_gelu name used by the evaluator. The coefficients are a
+    // minimax fit to max(0, x) on the bounded interval [-2, 2]:
     //
-    //   GELU(x) ~= 0.5*x + 0.3989422804*x^2 - 0.0664903801*x^4
+    //   ReLU(x) ~= 0.06762090 + 0.5*x + 0.48257484*x^2 - 0.06659632*x^4
     //
-    // Keeping this helper free of erf/tanh makes it usable in encrypted
-    // inference code as well as in ordinary host-side code.
+    // This minimax fit reduces the worst-case error on [-2, 2] while using
+    // the same multiplicative depth as the old GELU approximation.
 
-    // Evaluate the same polynomial on a CKKS ciphertext. The ciphertext must
-    // have at least three rescaling levels available, and the caller's scale
-    // should match the scale used to encrypt input.
+    // Evaluate the polynomial on a CKKS ciphertext. Accuracy is best when
+    // values entering the activation are mostly in [-2, 2]. The ciphertext
+    // must have at least three rescaling levels available, and the caller's
+    // scale should match the scale used to encrypt input.
     seal::Ciphertext approximate_gelu(
         const seal::Evaluator& evaluator,
         const seal::RelinKeys& relin_keys,
