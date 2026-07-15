@@ -1,0 +1,36 @@
+{
+    "cmake.sourceDirectory": "${workspaceFolder}",
+    "cmake.buildDirectory": "${workspaceFolder}/build-vscode",
+    "cmake.configureOnOpen": true,
+    "cmake.configureSettings": {
+        "SEAL_DIR": "${env:HOME}/.local/seal/lib/cmake/SEAL-4.3",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+    },
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build-vscode/compile_commands.json",
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/src",
+        "${env:HOME}/.local/seal/include/SEAL-4.3"
+    ],
+    "C_Cpp.default.browse.path": [
+        "${workspaceFolder}/src",
+        "${env:HOME}/.local/seal/include/SEAL-4.3"
+    ],
+    "C_Cpp.default.cppStandard": "c++17",
+    "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+    "files.associations": {
+        "**/src/SEALTorch/*.h": "cpp"
+    },
+    "files.exclude": {
+        "**/.git": true,
+        "**/build": true,
+        "**/build-vscode": true,
+        "**/out": true
+    },
+    "files.watcherExclude": {
+        "**/.git/**": true,
+        "**/build/**": true,
+        "**/build-vscode/**": true,
+        "**/out/**": true
+    }
+}

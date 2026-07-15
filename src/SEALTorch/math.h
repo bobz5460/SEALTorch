@@ -2,6 +2,8 @@
 
 #include <seal/seal.h>
 
+#include <vector>
+
 namespace sealtorch
 {
     seal::Ciphertext encrypted_dot_product(

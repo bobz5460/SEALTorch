@@ -1,6 +1,4 @@
-#include <seal/seal.h>
 #include "math.h"
-
 #include <cmath>
 #include <stdexcept>
 

@@ -1,9 +1,6 @@
 #pragma once
-
 #include <seal/seal.h>
-
-#include "sklearn_joblib_loader.h"
-
+#include <SEALTorch/model.h>
 #include <vector>
 
 namespace sealtorch
@@ -11,18 +8,13 @@ namespace sealtorch
     class Evaluator
     {
     public:
-        explicit Evaluator(SklearnMLPModel model);
+        explicit Evaluator(NeuralNetwork model);
 
-        void set_model(SklearnMLPModel model);
+        void set_model(NeuralNetwork model);
 
-        [[nodiscard]] const SklearnMLPModel &model() const noexcept;
-        [[nodiscard]] bool is_classifier() const noexcept;
-        [[nodiscard]] bool is_regressor() const noexcept;
+        const NeuralNetwork &model() const;
 
-        // Evaluates the model with CKKS ciphertext inputs. The returned
-        // ciphertexts are final-layer logits; this intentionally does not
-        // apply softmax or select/decrypt a class label.
-        [[nodiscard]] std::vector<seal::Ciphertext> predict(
+        std::vector<seal::Ciphertext> predict(
             const std::vector<seal::Ciphertext> &input,
             const seal::Evaluator &evaluator,
             const seal::RelinKeys &relin_keys,
@@ -30,8 +22,6 @@ namespace sealtorch
             double scale) const;
 
     private:
-        static void validate_model(const SklearnMLPModel &model);
-
-        SklearnMLPModel model_;
+        NeuralNetwork model_;
     };
 }
