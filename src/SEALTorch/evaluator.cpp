@@ -8,14 +8,6 @@
 
 namespace
 {
-    std::size_t checked_product(std::size_t left, std::size_t right)
-    {
-        if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right)
-        {
-            throw std::invalid_argument("MLP layer dimensions are too large");
-        }
-        return left * right;
-    }
 
     seal::Ciphertext evaluate_neuron(
         const std::vector<double> &weights,
