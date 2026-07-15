@@ -10,7 +10,8 @@ find_package(SEAL 4.3.3 EXACT CONFIG REQUIRED
     HINTS "${SEAL_DIR}")
 
 add_library(SEALTorch STATIC
-    src/SEALTorch/math.cpp)
+    src/SEALTorch/math.cpp
+    src/SEALTorch/evaluator.cpp)
 add_library(SEALTorch::SEALTorch ALIAS SEALTorch)
 
 target_compile_features(SEALTorch PUBLIC cxx_std_17)
@@ -20,6 +21,12 @@ target_include_directories(SEALTorch
         $<INSTALL_INTERFACE:include>)
 target_link_libraries(SEALTorch PUBLIC SEAL::seal)
 
-# Add your application or tests here as they are created. Keeping this file
-# small means the full SEAL source tree is never configured as part of your
-# project.
+find_package(X11 REQUIRED)
+
+add_executable(sealtorch_gui src/main.cpp)
+target_compile_features(sealtorch_gui PRIVATE cxx_std_17)
+target_link_libraries(sealtorch_gui PRIVATE SEALTorch::SEALTorch X11::X11)
+
+add_executable(sealtorch_tiny_test src/tiny_inference_test.cpp)
+target_compile_features(sealtorch_tiny_test PRIVATE cxx_std_17)
+target_link_libraries(sealtorch_tiny_test PRIVATE SEALTorch::SEALTorch)
