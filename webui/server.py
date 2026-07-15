@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import argparse
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,6 +56,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("127.0.0.1", 8000), Handler)
-    print("SEALTorch trace UI: http://127.0.0.1:8000")
+    parser = argparse.ArgumentParser(description="Serve the SEALTorch trace UI")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="interface to bind (use 0.0.0.0 for a cloud/container port forward)",
+    )
+    parser.add_argument("--port", type=int, default=8000, help="HTTP port")
+    args = parser.parse_args()
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    display_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
+    print(f"SEALTorch trace UI: http://{display_host}:{args.port}")
     server.serve_forever()
