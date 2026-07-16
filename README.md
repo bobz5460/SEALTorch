@@ -26,6 +26,21 @@ Open <http://127.0.0.1:8000>. Draw a digit and click **Run comparison**. The
  pre-activation values, post-activation values, and absolute error for every
  neuron in every layer.
 
+The **MNIST validation** tab runs a configurable number of images from the
+raw MNIST test set through each selected model. It reports plaintext GELU and
+ReLU accuracy, encrypted approximate-GELU accuracy, prediction agreement,
+per-image runtime, and mean encrypted/plain output error. The server looks for
+the raw files under `~/Documents/CSIRE/MLP_PyTorch/data/MNIST/raw` by default;
+use `--mnist-dir PATH` when they are elsewhere. The batch validator can also
+be run directly after building:
+
+```sh
+./build/sealtorch_validate \
+  --images /path/to/t10k-images-idx3-ubyte \
+  --labels /path/to/t10k-labels-idx1-ubyte \
+  --count 10 --model src/mnist_mlp_gelu.json
+```
+
 To access a UI running on another machine through SSH, keep the server bound
 to localhost and run this on your local machine:
 

@@ -40,6 +40,13 @@
     .bar-track i.green { background:var(--green); } .bar-track i.red { background:var(--red); }
     select { background:#252d39; border:1px solid #455064; color:var(--text); border-radius:6px; padding:8px; }
     .hint { color:var(--muted); font-size:12px; margin-top:10px; }
+    .tabs { display:flex; gap:8px; margin:0 0 18px; } .tab.active { background:var(--blue); }
+    .validation-controls { display:flex; flex-wrap:wrap; gap:12px; align-items:end; margin-bottom:16px; }
+    .validation-controls label { display:flex; flex-direction:column; gap:5px; color:var(--muted); }
+    input { background:#252d39; border:1px solid #455064; color:var(--text); border-radius:6px; padding:8px; width:110px; }
+    .checks { display:flex; flex-wrap:wrap; gap:10px; color:var(--text); } .checks label { flex-direction:row; align-items:center; }
+    .validation-table { overflow:auto; border:1px solid var(--line); border-radius:7px; }
+    .validation-table th, .validation-table td { text-align:right; } .validation-table th:first-child, .validation-table td:first-child { text-align:left; }
     @media (max-width:800px) { .top { grid-template-columns:1fr; } .summary { grid-template-columns:repeat(2,1fr); } }
   </style>
 </head>
@@ -47,6 +54,8 @@
 <main>
   <h1>SEALTorch CKKS trace</h1>
   <div class="subtitle">Draw a digit, then compare every neuron’s plaintext and encrypted values.</div>
+  <div class="tabs"><button class="tab active" data-tab="trace-view">Single-image trace</button><button class="tab secondary" data-tab="validation-view">MNIST validation</button></div>
+  <div id="trace-view">
   <section class="top">
     <div class="panel">
       <h2>Input</h2>
@@ -74,6 +83,18 @@
     <div class="panel chart"><h2>Error by layer</h2><div id="error-chart"></div></div>
   </section>
   <div id="layers"></div>
+  </div>
+  <section id="validation-view" class="panel" hidden>
+    <h2>MNIST validation comparison</h2>
+    <div class="hint">Runs the selected models on the raw MNIST test set. Ciphertext uses the encrypted approximate GELU path; plaintext reports both GELU and ReLU.</div>
+    <div class="validation-controls">
+      <label>Validation images <input id="validation-count" type="number" min="1" max="10000" value="10"></label>
+      <div><div class="hint">Models</div><div id="validation-models" class="checks"></div></div>
+      <button id="run-validation">Run validation</button>
+    </div>
+    <div id="validation-status" class="hint">Ready.</div>
+    <div id="validation-results"></div>
+  </section>
 </main>
 <script>
 const canvas = document.getElementById('canvas'), ctx = canvas.getContext('2d');
@@ -114,7 +135,18 @@ async function loadModels() {
   const select=document.getElementById('model');
   select.innerHTML=result.models.map(name=>`<option value="${name}">${name.replace(/^mnist_mlp_|\.json$/g,'')}</option>`).join('');
   if (result.default) select.value=result.default;
+  document.getElementById('validation-models').innerHTML=result.models.map((name,i)=>`<label><input type="checkbox" value="${name}" ${i<3?'checked':''}>${name.replace(/^mnist_mlp_|\.json$/g,'')}</label>`).join('');
 }
+document.querySelectorAll('.tab').forEach(tab=>tab.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));tab.classList.add('active');document.querySelectorAll('#trace-view,#validation-view').forEach(view=>view.hidden=view.id!==tab.dataset.tab);});
+document.getElementById('run-validation').onclick=async()=>{
+  const button=document.getElementById('run-validation'), status=document.getElementById('validation-status'), results=document.getElementById('validation-results');
+  const models=[...document.querySelectorAll('#validation-models input:checked')].map(x=>x.value), count=Number(document.getElementById('validation-count').value);
+  if(!models.length){status.textContent='Select at least one model.';return;} button.disabled=true;results.innerHTML='';status.textContent=`Running ${count} MNIST validation images; encrypted evaluation may take a while...`;
+  try { const response=await fetch('/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count,models})}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'validation failed');
+    const rows=result.models.map(m=>`<tr><td>${m.name.replace(/^.*mnist_mlp_/,'').replace(/\.json$/,'')}</td><td>${(m.plain_gelu_accuracy*100).toFixed(2)}%</td><td>${(m.plain_relu_accuracy*100).toFixed(2)}%</td><td>${(m.cipher_gelu_accuracy*100).toFixed(2)}%</td><td>${(m.cipher_vs_gelu_agreement*100).toFixed(2)}%</td><td>${(m.cipher_vs_relu_agreement*100).toFixed(2)}%</td><td>${Number(m.plain_ms_per_image).toFixed(2)} ms</td><td>${Number(m.cipher_ms_per_image).toFixed(2)} ms</td><td>${Number(m.mean_output_abs_error).toFixed(6)}</td></tr>`).join('');
+    results.innerHTML=`<div class="hint">Processed ${result.count} images.</div><div class="validation-table"><table><thead><tr><th>Model</th><th>Plain GELU acc.</th><th>Plain ReLU acc.</th><th>Cipher acc.</th><th>Cipher ↔ GELU</th><th>Cipher ↔ ReLU</th><th>Plain time/image</th><th>Cipher time/image</th><th>Mean output error</th></tr></thead><tbody>${rows}</tbody></table></div>`;status.textContent='Complete.';
+  } catch(error){status.textContent='Error: '+error.message;} finally{button.disabled=false;}
+};
 document.getElementById('run').onclick=async()=>{
   const button=document.getElementById('run'), status=document.getElementById('status'); button.disabled=true; status.textContent='Running plaintext and CKKS trace; this may take a minute...';
   try { const response=await fetch('/trace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pixels:pixels(),model:document.getElementById('model').value,activation:document.getElementById('activation').value})}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'trace failed');

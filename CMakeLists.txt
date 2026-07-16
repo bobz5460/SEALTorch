@@ -31,6 +31,10 @@ add_executable(sealtorch_trace src/trace_main.cpp)
 target_compile_features(sealtorch_trace PRIVATE cxx_std_17)
 target_link_libraries(sealtorch_trace PRIVATE SEALTorch::SEALTorch)
 
+add_executable(sealtorch_validate src/validate_main.cpp)
+target_compile_features(sealtorch_validate PRIVATE cxx_std_17)
+target_link_libraries(sealtorch_validate PRIVATE SEALTorch::SEALTorch)
+
 # Add your application or tests here as they are created. Keeping this file
 # small means the full SEAL source tree is never configured as part of your
 # project.
