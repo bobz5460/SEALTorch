@@ -30,8 +30,9 @@ The **MNIST validation** tab runs a configurable number of images from the
 raw MNIST test set through each selected model. It reports plaintext GELU and
 ReLU accuracy, encrypted approximate-GELU accuracy, prediction agreement,
 per-image runtime, and mean encrypted/plain output error. The server looks for
-the raw files under `~/Documents/CSIRE/MLP_PyTorch/data/MNIST/raw` by default;
-use `--mnist-dir PATH` when they are elsewhere. The batch validator can also
+the raw files under `data/MNIST/raw` inside this repository by default. Set the
+portable `MNIST_DIR` environment variable or use `--mnist-dir PATH` when they
+are elsewhere. The batch validator can also
 be run directly after building:
 
 ```sh

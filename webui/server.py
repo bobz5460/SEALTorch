@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import argparse
+import os
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,7 +56,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not path.exists():
                         raise ValueError("unknown model: " + str(name))
                     model_paths += ["--model", str(path)]
-                dataset = Path(self.server.mnist_dir)
+                dataset = self.server.mnist_dir
                 images = dataset / "t10k-images-idx3-ubyte"
                 labels = dataset / "t10k-labels-idx1-ubyte"
                 if not images.exists() or not labels.exists():
@@ -112,13 +113,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--port", type=int, default=8000, help="HTTP port")
     parser.add_argument("--threads", type=int, default=4, help="maximum concurrent neurons per layer")
-    default_mnist = Path.home() / "Documents/CSIRE/MLP_PyTorch/data/MNIST/raw"
-    parser.add_argument("--mnist-dir", default=str(default_mnist), help="directory containing raw t10k MNIST IDX files")
+    parser.add_argument(
+        "--mnist-dir",
+        default=None,
+        help="directory containing raw t10k MNIST IDX files (or set MNIST_DIR; default: ./data/MNIST/raw)",
+    )
     args = parser.parse_args()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.max_concurrency = max(1, args.threads)
-    server.mnist_dir = args.mnist_dir
+    server.mnist_dir = Path(args.mnist_dir or os.environ.get("MNIST_DIR", ROOT / "data" / "MNIST" / "raw"))
     display_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
     print(f"SEALTorch trace UI: http://{display_host}:{args.port}")
     server.serve_forever()
