@@ -52,6 +52,7 @@
       <h2>Input</h2>
       <canvas id="canvas" width="280" height="280"></canvas>
       <div class="controls"><button id="run">Run comparison</button><button class="secondary" id="clear">Clear</button><select id="expected" title="Optional ground-truth digit"><option value="">Expected: —</option><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option></select></div>
+      <div class="controls"><label>Model <select id="model"></select></label><label>Plain activation <select id="activation"><option value="gelu">GELU</option><option value="relu">ReLU</option></select></label></div>
       <div id="status">Ready.</div>
       <div class="hint">The browser samples this canvas into 28×28 normalized pixels.</div>
     </div>
@@ -63,7 +64,7 @@
         <div class="metric"><label>Largest post-activation error</label><strong id="max-error">—</strong></div>
         <div class="metric"><label>Mean post-activation error</label><strong id="mean-error">—</strong></div>
       </div>
-      <p class="hint">Pre values are before activation. Post values compare the new JSON model's plaintext ApproximateGELU with its encrypted CKKS evaluation.</p>
+        <p class="hint">Pre values are before activation. Plaintext uses the selected activation; CKKS continues to use its encrypted approximate GELU implementation.</p>
     </div>
   </section>
   <section class="charts" id="charts" hidden>
@@ -108,15 +109,22 @@ function renderCharts(result, plain, ckks, plainPred, ckksPred) {
   const layerErrors=result.layers.map(l=>{const e=l.plaintext_post.map((x,i)=>Math.abs(x-l.ckks_post[i]));return {max:Math.max(...e),mean:e.reduce((a,b)=>a+b,0)/e.length};}), maxLayer=Math.max(...layerErrors.map(x=>x.max),1); document.getElementById('error-chart').innerHTML=layerErrors.map((e,i)=>bar(`Layer ${i+1}`,`${fmt(e.max)} max`,e.max/maxLayer*100,e.max>.05?'red':'')).join('');
   document.getElementById('charts').hidden=false;
 }
+async function loadModels() {
+  const response=await fetch('/models'); const result=await response.json();
+  const select=document.getElementById('model');
+  select.innerHTML=result.models.map(name=>`<option value="${name}">${name.replace(/^mnist_mlp_|\.json$/g,'')}</option>`).join('');
+  if (result.default) select.value=result.default;
+}
 document.getElementById('run').onclick=async()=>{
   const button=document.getElementById('run'), status=document.getElementById('status'); button.disabled=true; status.textContent='Running plaintext and CKKS trace; this may take a minute...';
-  try { const response=await fetch('/trace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pixels())}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'trace failed');
+  try { const response=await fetch('/trace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pixels:pixels(),model:document.getElementById('model').value,activation:document.getElementById('activation').value})}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'trace failed');
     const last=result.layers[result.layers.length-1], plain=softmax(last.plaintext_post), ckks=softmax(last.ckks_post);
     const plainPred=plain.indexOf(Math.max(...plain)), ckksPred=ckks.indexOf(Math.max(...ckks)); document.getElementById('plain-pred').textContent=plainPred; document.getElementById('ckks-pred').textContent=ckksPred;
     const errors=result.layers.flatMap(l=>l.plaintext_post.map((x,i)=>Math.abs(x-l.ckks_post[i]))); document.getElementById('max-error').textContent=fmt(Math.max(...errors)); document.getElementById('mean-error').textContent=fmt(errors.reduce((a,b)=>a+b,0)/errors.length);
     renderCharts(result,plain,ckks,plainPred,ckksPred); document.getElementById('layers').innerHTML=result.layers.map(layerTable).join(''); status.textContent='Complete.';
   } catch(error) { status.textContent='Error: '+error.message; } finally { button.disabled=false; }
 };
+loadModels().catch(error => { document.getElementById('status').textContent='Could not load models: '+error.message; });
 </script>
 </body>
 </html>

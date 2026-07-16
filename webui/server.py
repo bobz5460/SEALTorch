@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TRACE = ROOT / "build" / "sealtorch_trace"
-MODEL = ROOT / "src" / "mnist_mlp_gelu_improved.json"
+MODEL_DIR = ROOT / "src"
 INDEX = Path(__file__).with_name("index.html")
 
 
@@ -22,6 +22,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
             self.send_bytes(200, "text/html; charset=utf-8", INDEX.read_bytes())
+        elif self.path == "/models":
+            models = sorted(path.name for path in MODEL_DIR.glob("*.json")
+                            if path.name.startswith("mnist_mlp_"))
+            self.send_bytes(200, "application/json; charset=utf-8", json.dumps({
+                "models": models,
+                "default": "mnist_mlp_gelu_improved.json" if "mnist_mlp_gelu_improved.json" in models else (models[0] if models else ""),
+            }).encode())
         else:
             self.send_bytes(404, "text/plain; charset=utf-8", b"Not found\n")
 
@@ -31,13 +38,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            values = json.loads(self.rfile.read(length))
+            request = json.loads(self.rfile.read(length))
+            if isinstance(request, list):
+                values, model_name, activation = request, "mnist_mlp_gelu_improved.json", "gelu"
+            else:
+                values = request.get("pixels")
+                model_name = request.get("model", "mnist_mlp_gelu_improved.json")
+                activation = request.get("activation", "gelu")
             if not isinstance(values, list) or len(values) != 784:
                 raise ValueError("expected exactly 784 input values")
+            if activation not in {"relu", "gelu"}:
+                raise ValueError("activation must be relu or gelu")
+            model_path = MODEL_DIR / Path(str(model_name)).name
+            if model_path.parent != MODEL_DIR or not model_path.name.startswith("mnist_mlp_") or model_path.suffix != ".json" or not model_path.exists():
+                raise ValueError("unknown model")
             if not TRACE.exists():
                 raise RuntimeError("build/sealtorch_trace does not exist; run cmake --build build first")
             completed = subprocess.run(
-                [str(TRACE), str(MODEL), "--threads", str(self.server.max_concurrency)],
+                [str(TRACE), str(model_path), "--activation", activation,
+                 "--threads", str(self.server.max_concurrency)],
                 input=" ".join(str(float(value)) for value in values) + "\n",
                 text=True,
                 capture_output=True,

@@ -112,6 +112,11 @@ static double approximate_gelu_plain(double value)
         - 0.06659632 * value * value * value * value;
 }
 
+static double activate_plain(double value, const std::string &activation)
+{
+    return activation == "relu" ? std::max(0.0, value) : approximate_gelu_plain(value);
+}
+
 static std::vector<double> decrypt(const std::vector<seal::Ciphertext> &values,
                                    seal::Decryptor &decryptor, seal::CKKSEncoder &encoder)
 {
@@ -143,14 +148,18 @@ int main(int argc, char **argv)
 {
     try {
         std::string model_path = "src/mnist_mlp_gelu_improved.json";
+        std::string plaintext_activation = "gelu";
         std::size_t max_concurrency = 4;
         for (int arg = 1; arg < argc; ++arg) {
             const std::string value = argv[arg];
             if (value == "--threads" && arg + 1 < argc) max_concurrency = std::stoull(argv[++arg]);
-            else if (value == "--help") { std::cout << "usage: sealtorch_trace [model.json] [--threads N]\n"; return 0; }
+            else if (value == "--activation" && arg + 1 < argc) plaintext_activation = argv[++arg];
+            else if (value == "--help") { std::cout << "usage: sealtorch_trace [model.json] [--activation relu|gelu] [--threads N]\n"; return 0; }
             else if (!value.empty() && value[0] != '-') model_path = value;
             else throw std::runtime_error("unknown argument: " + value);
         }
+        if (plaintext_activation != "relu" && plaintext_activation != "gelu")
+            throw std::runtime_error("activation must be relu or gelu");
         const auto model = load_model(model_path);
         const auto input = read_input();
         std::vector<double> plaintext = input;
@@ -175,7 +184,7 @@ int main(int argc, char **argv)
             traces[index].plaintext_pre = plaintext_layer(layer, plaintext);
             traces[index].plaintext_post = traces[index].plaintext_pre;
             if (index + 1 != model.layers.size()) {
-                for (double &value : traces[index].plaintext_post) value = approximate_gelu_plain(value);
+                for (double &value : traces[index].plaintext_post) value = activate_plain(value, plaintext_activation);
             }
             plaintext = traces[index].plaintext_post;
         }
@@ -196,6 +205,7 @@ int main(int argc, char **argv)
         const double peak_memory_mb = static_cast<double>(usage.ru_maxrss) / 1024.0;
         std::cout << "{\"metrics\":{";
         std::cout << "\"plaintext_ms\":" << plaintext_ms;
+        std::cout << ",\"plaintext_activation\":\"" << plaintext_activation << '\"';
         std::cout << ",\"encrypted_ms\":" << encrypted_ms;
         std::cout << ",\"peak_memory_mb\":" << peak_memory_mb << "},\"layers\":[";
         for (std::size_t index = 0; index < traces.size(); ++index) {
