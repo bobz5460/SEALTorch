@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TRACE = ROOT / "build" / "sealtorch_trace"
-MODEL = ROOT / "src" / "mnist_mlp_gelu.json"
+MODEL = ROOT / "src" / "mnist_mlp_gelu_improved.json"
 INDEX = Path(__file__).with_name("index.html")
 
 
