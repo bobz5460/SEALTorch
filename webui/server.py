@@ -60,7 +60,7 @@ class Handler(BaseHTTPRequestHandler):
             }).encode())
         elif self.path.startswith("/validate/status"):
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
-            job_id = query.removeprefix("id=")
+            job_id = query[3:] if query.startswith("id=") else ""
             with JOBS_LOCK:
                 job = dict(JOBS.get(job_id, {"state": "error", "error": "unknown validation job"}))
             self.send_bytes(200, "application/json; charset=utf-8", json.dumps(job).encode())
