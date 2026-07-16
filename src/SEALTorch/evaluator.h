@@ -19,6 +19,8 @@ namespace sealtorch
     };
 
     using ProgressCallback = std::function<void(const ProgressInfo &)>;
+    using LayerCallback = std::function<void(std::size_t layer, bool after_activation,
+                                             const std::vector<seal::Ciphertext> &values)>;
 
     class Evaluator
     {
@@ -39,7 +41,8 @@ namespace sealtorch
             const seal::GaloisKeys &galois_keys,
             seal::CKKSEncoder &encoder,
             double scale,
-            const ProgressCallback &progress = {}) const;
+            const ProgressCallback &progress = {},
+            const LayerCallback &layer_callback = {}) const;
 
     private:
         NeuralNetwork model_;

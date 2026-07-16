@@ -134,7 +134,8 @@ namespace sealtorch
         const seal::GaloisKeys &galois_keys,
         seal::CKKSEncoder &encoder,
         double scale,
-        const ProgressCallback &progress) const
+        const ProgressCallback &progress,
+        const LayerCallback &layer_callback) const
     {
         std::vector<seal::Ciphertext> values;
         std::size_t total = 0;
@@ -165,6 +166,7 @@ namespace sealtorch
                 }
             }
 
+            if (layer_callback) layer_callback(static_cast<std::size_t>(layer), false, next);
             if (layer + 1 != model_.layers.size())
             {
                 if (progress) progress({"applying encrypted activation", static_cast<std::size_t>(layer + 1),
@@ -175,6 +177,7 @@ namespace sealtorch
                     ciphertext = approximate_gelu(evaluator, relin_keys, encoder, ciphertext, scale);
                 }
             }
+            if (layer_callback) layer_callback(static_cast<std::size_t>(layer), true, next);
             values = std::move(next);
 
         }

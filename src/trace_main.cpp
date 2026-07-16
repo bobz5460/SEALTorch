@@ -6,7 +6,6 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
-#include <future>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -126,47 +125,6 @@ static std::vector<double> decrypt(const std::vector<seal::Ciphertext> &values,
     return result;
 }
 
-static std::vector<seal::Ciphertext> encrypted_layer(
-    const DenseLayer &layer, const std::vector<seal::Ciphertext> &input,
-    const seal::Evaluator &evaluator, const seal::RelinKeys &relin_keys,
-    const seal::GaloisKeys &galois_keys, seal::CKKSEncoder &encoder, double scale,
-    std::size_t max_concurrency)
-{
-    std::vector<seal::Ciphertext> result(static_cast<std::size_t>(layer.output_size));
-    const std::size_t workers = std::max<std::size_t>(1, std::min<std::size_t>(
-        static_cast<std::size_t>(layer.output_size), max_concurrency == 0 ? 1 : max_concurrency));
-    for (std::size_t start = 0; start < result.size(); start += workers) {
-        const std::size_t end = std::min(result.size(), start + workers);
-        std::vector<std::future<seal::Ciphertext>> futures;
-        futures.reserve(end - start);
-        for (std::size_t output = start; output < end; ++output) {
-            futures.emplace_back(std::async(std::launch::async, [&, output] {
-        seal::Ciphertext value;
-        if (input.size() == 1) {
-            seal::Plaintext weights; encoder.encode(layer.weights[output], scale, weights);
-            value = sealtorch::encrypted_dot_product(evaluator, galois_keys, weights, input.front(), layer.weights[output].size());
-        } else {
-            for (std::size_t index = 0; index < layer.weights[output].size(); ++index) {
-                seal::Plaintext weight; encoder.encode(layer.weights[output][index], scale, weight);
-                evaluator.mod_switch_to_inplace(weight, input[index].parms_id());
-                seal::Ciphertext term; evaluator.multiply_plain(input[index], weight, term);
-                if (index == 0) value = std::move(term); else evaluator.add_inplace(value, term);
-            }
-        }
-        evaluator.rescale_to_next_inplace(value);
-        seal::Plaintext bias; encoder.encode(layer.biases[output], value.scale(), bias);
-        evaluator.mod_switch_to_inplace(bias, value.parms_id());
-        evaluator.add_plain_inplace(value, bias);
-        return value;
-            }));
-        }
-        for (std::size_t output = start; output < end; ++output)
-            result[output] = futures[output - start].get();
-    }
-    (void)relin_keys;
-    return result;
-}
-
 static std::vector<double> read_input()
 {
     std::vector<double> input(784);
@@ -208,33 +166,30 @@ int main(int argc, char **argv)
         constexpr double scale = 1073741824.0;
         seal::Plaintext encoded; encoder.encode(input, scale, encoded); seal::Ciphertext encrypted; encryptor.encrypt_symmetric(encoded, encrypted);
         std::vector<seal::Ciphertext> encrypted_values{std::move(encrypted)};
-        std::vector<TraceLayer> traces;
+        sealtorch::Evaluator model_evaluator(model, max_concurrency);
+        std::vector<TraceLayer> traces(model.layers.size());
         double plaintext_ms = 0.0;
-        double encrypted_ms = 0.0;
-
+        const auto plaintext_total_start = std::chrono::steady_clock::now();
         for (std::size_t index = 0; index < model.layers.size(); ++index) {
             const auto &layer = model.layers[index];
-            TraceLayer trace;
-            const auto plaintext_start = std::chrono::steady_clock::now();
-            trace.plaintext_pre = plaintext_layer(layer, plaintext);
-            const auto plaintext_end = std::chrono::steady_clock::now();
-            plaintext_ms += std::chrono::duration<double, std::milli>(plaintext_end - plaintext_start).count();
-
-            const auto encrypted_start = std::chrono::steady_clock::now();
-            encrypted_values = encrypted_layer(layer, encrypted_values, evaluator, relin_keys, galois_keys, encoder, scale, max_concurrency);
-            trace.ckks_pre = decrypt(encrypted_values, decryptor, encoder);
-            trace.plaintext_post = trace.plaintext_pre;
-            trace.ckks_post = trace.ckks_pre;
+            traces[index].plaintext_pre = plaintext_layer(layer, plaintext);
+            traces[index].plaintext_post = traces[index].plaintext_pre;
             if (index + 1 != model.layers.size()) {
-                for (double &value : trace.plaintext_post) value = approximate_gelu_plain(value);
-                for (auto &value : encrypted_values) value = sealtorch::approximate_gelu(evaluator, relin_keys, encoder, value, scale);
-                trace.ckks_post = decrypt(encrypted_values, decryptor, encoder);
+                for (double &value : traces[index].plaintext_post) value = approximate_gelu_plain(value);
             }
-            const auto encrypted_end = std::chrono::steady_clock::now();
-            encrypted_ms += std::chrono::duration<double, std::milli>(encrypted_end - encrypted_start).count();
-            plaintext = trace.plaintext_post;
-            traces.push_back(std::move(trace));
+            plaintext = traces[index].plaintext_post;
         }
+        const auto plaintext_total_end = std::chrono::steady_clock::now();
+        plaintext_ms = std::chrono::duration<double, std::milli>(plaintext_total_end - plaintext_total_start).count();
+
+        const auto encrypted_start = std::chrono::steady_clock::now();
+        model_evaluator.predict(encrypted_values, evaluator, relin_keys, galois_keys, encoder, scale, {},
+            [&](std::size_t layer, bool after_activation, const std::vector<seal::Ciphertext> &values) {
+                if (after_activation) traces[layer].ckks_post = decrypt(values, decryptor, encoder);
+                else traces[layer].ckks_pre = decrypt(values, decryptor, encoder);
+            });
+        const auto encrypted_end = std::chrono::steady_clock::now();
+        const double encrypted_ms = std::chrono::duration<double, std::milli>(encrypted_end - encrypted_start).count();
 
         struct rusage usage{};
         getrusage(RUSAGE_SELF, &usage);
