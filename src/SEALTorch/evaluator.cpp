@@ -2,17 +2,16 @@
 
 #include "math.h"
 
-#include <limits>
 #include <algorithm>
 #include <future>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 
 namespace
 {
     template <typename Function>
-    auto parallel_neurons(std::size_t count, std::size_t max_concurrency, Function function)
+    // Run at most max_concurrency jobs at a time, while preserving result order.
+    auto parallel_map(std::size_t count, std::size_t max_concurrency, Function function)
         -> std::vector<std::invoke_result_t<Function, std::size_t>>
     {
         using Result = std::invoke_result_t<Function, std::size_t>;
@@ -139,47 +138,47 @@ namespace sealtorch
     {
         std::vector<seal::Ciphertext> values;
         std::size_t total = 0;
-        for (const auto &layer : model_.layers) total += static_cast<std::size_t>(layer.output_size);
+        for (const auto &layer : model_.layers)
+            total += static_cast<std::size_t>(layer.output_size);
         std::size_t completed = 0;
         if (progress) progress({"starting encrypted network", 0, model_.layers.size(), 0, total, 0, 0});
 
-        for (int layer = 0; layer < model_.layers.size(); layer++)
+        for (std::size_t layer = 0; layer < model_.layers.size(); ++layer)
         {
-            const auto output_width = model_.layers[layer].output_size;
             const auto &current_layer = model_.layers[layer];
-            auto next = parallel_neurons(static_cast<std::size_t>(output_width), max_concurrency_,
-                [&](std::size_t output) {
-                    if (layer == 0)
-                        return evaluate_neuron(current_layer.weights[output], input.front(),
-                            current_layer.biases[output], evaluator, galois_keys, encoder, scale);
-                    return evaluate_scalar_neuron(current_layer.weights[output], values,
-                        current_layer.biases[output], evaluator, encoder, scale);
-                });
+            const std::size_t output_width = static_cast<std::size_t>(current_layer.output_size);
 
-            for (int output = 0; output < output_width; ++output)
+            // Neurons in one layer are independent, so evaluate them concurrently.
+            auto next = parallel_map(output_width, max_concurrency_, [&](std::size_t output) {
+                if (layer == 0)
+                    return evaluate_neuron(current_layer.weights[output], input.front(),
+                        current_layer.biases[output], evaluator, galois_keys, encoder, scale);
+                return evaluate_scalar_neuron(current_layer.weights[output], values,
+                    current_layer.biases[output], evaluator, encoder, scale);
+            });
+
+            for (std::size_t output = 0; output < output_width; ++output)
             {
                 ++completed;
                 if (progress) {
-                    progress({"evaluating encrypted layer", static_cast<std::size_t>(layer + 1), model_.layers.size(),
-                              completed, total, static_cast<std::size_t>(output + 1),
-                              static_cast<std::size_t>(output_width)});
+                    progress({"evaluating encrypted layer", layer + 1, model_.layers.size(),
+                              completed, total, output + 1, output_width});
                 }
             }
 
-            if (layer_callback) layer_callback(static_cast<std::size_t>(layer), false, next);
-            if (layer + 1 != model_.layers.size())
+            if (layer_callback) layer_callback(layer, false, next);
+            if (layer + 1 < model_.layers.size())
             {
-                if (progress) progress({"applying encrypted activation", static_cast<std::size_t>(layer + 1),
-                                         model_.layers.size(), completed, total, 0,
-                                         static_cast<std::size_t>(next.size())});
-                for (auto &ciphertext : next)
-                {
-                    ciphertext = approximate_gelu(evaluator, relin_keys, encoder, ciphertext, scale);
-                }
-            }
-            if (layer_callback) layer_callback(static_cast<std::size_t>(layer), true, next);
-            values = std::move(next);
+                if (progress) progress({"applying encrypted activation", layer + 1,
+                                         model_.layers.size(), completed, total, 0, next.size()});
 
+                // Activations are also independent, so run one async job per neuron.
+                next = parallel_map(next.size(), max_concurrency_, [&](std::size_t neuron) {
+                    return approximate_gelu(evaluator, relin_keys, encoder, next[neuron], scale);
+                });
+            }
+            if (layer_callback) layer_callback(layer, true, next);
+            values = std::move(next);
         }
         return values;
     }

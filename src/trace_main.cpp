@@ -142,7 +142,7 @@ static void write_array(const std::vector<double> &values)
 int main(int argc, char **argv)
 {
     try {
-        std::string model_path = "src/mnist_mlp_gelu.json";
+        std::string model_path = "src/mnist_mlp_gelu_improved.json";
         std::size_t max_concurrency = 4;
         for (int arg = 1; arg < argc; ++arg) {
             const std::string value = argv[arg];
