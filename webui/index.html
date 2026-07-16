@@ -5,16 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SEALTorch CKKS Trace</title>
   <style>
-    :root { color-scheme: dark; --bg:#101318; --panel:#191e27; --line:#303846; --text:#eef2f7; --muted:#9ba7b7; --blue:#4b8bff; --green:#35d07f; --red:#ff7777; }
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#151d31; --panel-2:#1b263d; --line:#2d3b57; --text:#f3f6ff; --muted:#9eabc2; --blue:#6c8cff; --green:#3de08e; --red:#ff7777; }
     * { box-sizing:border-box; }
-    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui,sans-serif; }
-    main { max-width:1500px; margin:0 auto; padding:22px; }
-    h1 { margin:0 0 5px; font-size:24px; } h2 { margin:0 0 12px; font-size:17px; }
+    body { margin:0; background:radial-gradient(circle at 10% 0%,#172448 0,#0b1020 42%); color:var(--text); font:14px/1.45 system-ui,sans-serif; }
+    main { max-width:1500px; margin:0 auto; padding:34px 24px 50px; }
+    h1 { margin:0 0 5px; font-size:28px; letter-spacing:-.02em; } h2 { margin:0 0 12px; font-size:17px; }
     .subtitle { color:var(--muted); margin-bottom:18px; }
     .top { display:grid; grid-template-columns:310px 1fr; gap:18px; align-items:start; }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+    .panel { background:linear-gradient(145deg,var(--panel),#121a2b); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 12px 35px #05091455; }
     canvas { display:block; width:280px; height:280px; background:#000; border:1px solid #455064; image-rendering:pixelated; cursor:crosshair; }
-    button { border:0; border-radius:6px; color:#fff; background:var(--blue); padding:9px 14px; cursor:pointer; font-weight:600; }
+    button { border:0; border-radius:8px; color:#fff; background:var(--blue); padding:10px 15px; cursor:pointer; font-weight:650; box-shadow:0 4px 14px #6c8cff35; }
     button.secondary { background:#394352; } button:disabled { opacity:.5; cursor:wait; }
     .controls { display:flex; gap:8px; margin-top:12px; }
     #status { color:var(--muted); margin-top:11px; min-height:22px; }
@@ -40,14 +40,19 @@
     .bar-track i.green { background:var(--green); } .bar-track i.red { background:var(--red); }
     select { background:#252d39; border:1px solid #455064; color:var(--text); border-radius:6px; padding:8px; }
     .hint { color:var(--muted); font-size:12px; margin-top:10px; }
-    .tabs { display:flex; gap:8px; margin:0 0 18px; } .tab.active { background:var(--blue); }
+    .tabs { display:flex; gap:8px; margin:26px 0 20px; padding:5px; width:max-content; background:#0d1527; border:1px solid var(--line); border-radius:11px; } .tab { box-shadow:none; } .tab.active { background:var(--blue); }
     .validation-controls { display:flex; flex-wrap:wrap; gap:12px; align-items:end; margin-bottom:16px; }
     .validation-controls label { display:flex; flex-direction:column; gap:5px; color:var(--muted); }
     input { background:#252d39; border:1px solid #455064; color:var(--text); border-radius:6px; padding:8px; width:110px; }
     .checks { display:flex; flex-wrap:wrap; gap:10px; color:var(--text); } .checks label { flex-direction:row; align-items:center; }
-    .validation-table { overflow:auto; border:1px solid var(--line); border-radius:7px; }
+    .progress-wrap { margin:16px 0 20px; } .progress-meta { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; margin-bottom:7px; } .progress-track { height:12px; background:#0b1222; border:1px solid var(--line); border-radius:8px; overflow:hidden; } .progress-fill { height:100%; width:0; background:linear-gradient(90deg,var(--blue),var(--green)); transition:width .25s ease; }
+    .validation-summary { display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:10px; margin:18px 0; }
+    .validation-graphs { display:grid; grid-template-columns:repeat(2,minmax(280px,1fr)); gap:12px; margin:14px 0; }
+    .info-box { color:var(--muted); background:#10182a; border:1px solid var(--line); border-radius:9px; padding:12px 14px; margin:14px 0; }
+    .info-box strong { color:var(--text); } .legend { display:flex; gap:14px; flex-wrap:wrap; color:var(--muted); font-size:12px; margin-bottom:8px; } .legend span::before { content:''; display:inline-block; width:9px; height:9px; border-radius:3px; background:var(--blue); margin-right:5px; } .legend .green::before { background:var(--green); } .legend .red::before { background:var(--red); }
+    .validation-table { overflow:auto; border:1px solid var(--line); border-radius:9px; }
     .validation-table th, .validation-table td { text-align:right; } .validation-table th:first-child, .validation-table td:first-child { text-align:left; }
-    @media (max-width:800px) { .top { grid-template-columns:1fr; } .summary { grid-template-columns:repeat(2,1fr); } }
+    @media (max-width:800px) { .top { grid-template-columns:1fr; } .summary,.validation-summary { grid-template-columns:repeat(2,1fr); } .validation-graphs { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -93,6 +98,7 @@
       <button id="run-validation">Run validation</button>
     </div>
     <div id="validation-status" class="hint">Ready.</div>
+    <div class="progress-wrap"><div class="progress-meta"><span id="validation-progress-label">Waiting to start</span><span id="validation-progress-percent">0%</span></div><div class="progress-track"><div id="validation-progress-fill" class="progress-fill"></div></div></div>
     <div id="validation-results"></div>
   </section>
 </main>
@@ -120,6 +126,17 @@ function layerTable(layer, index) {
 }
 function softmax(a) { const m=Math.max(...a), e=a.map(x=>Math.exp(x-m)), s=e.reduce((x,y)=>x+y,0); return e.map(x=>x/s); }
 function bar(label, value, width, className='') { return `<div class="bar-row"><span>${label}</span><div class="bar-track"><i class="${className}" style="width:${Math.max(0,Math.min(100,width))}%"></i></div><strong>${value}</strong></div>`; }
+function validationCharts(result) {
+  const models=result.models, maxRuntime=Math.max(...models.map(m=>Number(m.cipher_ms_per_image)||0),1), maxError=Math.max(...models.map(m=>Number(m.mean_output_abs_error)||0),1);
+  let accuracy='',runtime='',agreement='',error='';
+  models.forEach(m=>{const name=m.name.replace(/^.*mnist_mlp_/,'').replace(/\.json$/,''); accuracy+=`<div class="hint" style="margin-top:12px;color:var(--text)">${name}</div>`; accuracy+=bar('Plain GELU',`${(m.plain_gelu_accuracy*100).toFixed(1)}%`,m.plain_gelu_accuracy*100); accuracy+=bar('Plain ReLU',`${(m.plain_relu_accuracy*100).toFixed(1)}%`,m.plain_relu_accuracy*100,'green'); accuracy+=bar('Cipher GELU',`${(m.cipher_gelu_accuracy*100).toFixed(1)}%`,m.cipher_gelu_accuracy*100,'red'); runtime+=bar(name+' plain',`${Number(m.plain_ms_per_image).toFixed(1)} ms`,Number(m.plain_ms_per_image)/maxRuntime*100); runtime+=bar(name+' cipher',`${Number(m.cipher_ms_per_image).toFixed(1)} ms`,Number(m.cipher_ms_per_image)/maxRuntime*100,'green'); agreement+=bar(name+' ↔ GELU',`${(m.cipher_vs_gelu_agreement*100).toFixed(1)}%`,m.cipher_vs_gelu_agreement*100); agreement+=bar(name+' ↔ ReLU',`${(m.cipher_vs_relu_agreement*100).toFixed(1)}%`,m.cipher_vs_relu_agreement*100,'green'); error+=bar(name,Number(m.mean_output_abs_error).toFixed(6),Number(m.mean_output_abs_error)/maxError*100,Number(m.mean_output_abs_error)>.05?'red':'');});
+  return `<div class="validation-graphs"><div class="panel chart"><h2>Accuracy by model</h2><div class="legend"><span>Plain GELU</span><span class="green">Plain ReLU</span><span class="red">Cipher GELU</span></div>${accuracy}</div><div class="panel chart"><h2>Runtime per image</h2><div class="legend"><span>Plain</span><span class="green">Cipher</span></div>${runtime}</div><div class="panel chart"><h2>Cipher agreement</h2><div class="legend"><span>↔ GELU</span><span class="green">↔ ReLU</span></div>${agreement}</div><div class="panel chart"><h2>Mean output error</h2><div class="hint">Bars are scaled to the largest error in this run.</div>${error}</div></div>`;
+}
+function renderValidationResults(result) {
+  const models=result.models, best=Math.max(...models.map(m=>m.cipher_gelu_accuracy)), agreement=Math.max(...models.map(m=>m.cipher_vs_gelu_agreement)), avgCipher=models.reduce((s,m)=>s+Number(m.cipher_ms_per_image),0)/models.length;
+  const rows=models.map(m=>`<tr><td>${m.name.replace(/^.*mnist_mlp_/,'').replace(/\.json$/,'')}</td><td>${(m.plain_gelu_accuracy*100).toFixed(2)}%</td><td>${(m.plain_relu_accuracy*100).toFixed(2)}%</td><td>${(m.cipher_gelu_accuracy*100).toFixed(2)}%</td><td>${(m.cipher_vs_gelu_agreement*100).toFixed(2)}%</td><td>${(m.cipher_vs_relu_agreement*100).toFixed(2)}%</td><td>${Number(m.plain_ms_per_image).toFixed(2)} ms</td><td>${Number(m.cipher_ms_per_image).toFixed(2)} ms</td><td>${Number(m.mean_output_abs_error).toFixed(6)}</td></tr>`).join('');
+  return `<div class="validation-summary"><div class="metric"><label>Images processed</label><strong>${result.count}</strong></div><div class="metric"><label>Models compared</label><strong>${models.length}</strong></div><div class="metric"><label>Best cipher accuracy</label><strong>${(best*100).toFixed(2)}%</strong></div><div class="metric"><label>Avg. cipher time/image</label><strong>${avgCipher.toFixed(1)} ms</strong></div></div>${validationCharts(result)}<div class="info-box"><strong>How to read this:</strong> Plain GELU and Plain ReLU are ordinary reference inference paths. Cipher GELU is the encrypted approximate-GELU path. Agreement measures how often encrypted predictions match each plaintext reference; mean output error compares the ten output logits, not just the final class.</div><div class="hint">Processed ${result.count} images. Best cipher↔GELU agreement: ${(agreement*100).toFixed(2)}%.</div><div class="validation-table"><table><thead><tr><th>Model</th><th>Plain GELU acc.</th><th>Plain ReLU acc.</th><th>Cipher acc.</th><th>Cipher ↔ GELU</th><th>Cipher ↔ ReLU</th><th>Plain time/image</th><th>Cipher time/image</th><th>Mean output error</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
 function renderCharts(result, plain, ckks, plainPred, ckksPred) {
   const metrics=result.metrics||{}, agreement=plainPred===ckksPred, expected=document.getElementById('expected').value;
   const accuracy=expected===''?'—':(Number(expected)===plainPred?'100%':'0%');
@@ -140,11 +157,12 @@ async function loadModels() {
 document.querySelectorAll('.tab').forEach(tab=>tab.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));tab.classList.add('active');document.querySelectorAll('#trace-view,#validation-view').forEach(view=>view.hidden=view.id!==tab.dataset.tab);});
 document.getElementById('run-validation').onclick=async()=>{
   const button=document.getElementById('run-validation'), status=document.getElementById('validation-status'), results=document.getElementById('validation-results');
+  const fill=document.getElementById('validation-progress-fill'), progressLabel=document.getElementById('validation-progress-label'), progressPercent=document.getElementById('validation-progress-percent');
   const models=[...document.querySelectorAll('#validation-models input:checked')].map(x=>x.value), count=Number(document.getElementById('validation-count').value);
-  if(!models.length){status.textContent='Select at least one model.';return;} button.disabled=true;results.innerHTML='';status.textContent=`Running ${count} MNIST validation images; encrypted evaluation may take a while...`;
-  try { const response=await fetch('/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count,models})}); const result=await response.json(); if(!response.ok) throw new Error(result.error||'validation failed');
-    const rows=result.models.map(m=>`<tr><td>${m.name.replace(/^.*mnist_mlp_/,'').replace(/\.json$/,'')}</td><td>${(m.plain_gelu_accuracy*100).toFixed(2)}%</td><td>${(m.plain_relu_accuracy*100).toFixed(2)}%</td><td>${(m.cipher_gelu_accuracy*100).toFixed(2)}%</td><td>${(m.cipher_vs_gelu_agreement*100).toFixed(2)}%</td><td>${(m.cipher_vs_relu_agreement*100).toFixed(2)}%</td><td>${Number(m.plain_ms_per_image).toFixed(2)} ms</td><td>${Number(m.cipher_ms_per_image).toFixed(2)} ms</td><td>${Number(m.mean_output_abs_error).toFixed(6)}</td></tr>`).join('');
-    results.innerHTML=`<div class="hint">Processed ${result.count} images.</div><div class="validation-table"><table><thead><tr><th>Model</th><th>Plain GELU acc.</th><th>Plain ReLU acc.</th><th>Cipher acc.</th><th>Cipher ↔ GELU</th><th>Cipher ↔ ReLU</th><th>Plain time/image</th><th>Cipher time/image</th><th>Mean output error</th></tr></thead><tbody>${rows}</tbody></table></div>`;status.textContent='Complete.';
+  if(!models.length){status.textContent='Select at least one model.';return;} button.disabled=true;results.innerHTML='';fill.style.width='0%';progressPercent.textContent='0%';progressLabel.textContent='Starting…';status.textContent=`Running ${count} MNIST validation images; encrypted evaluation may take a while...`;
+  try { const response=await fetch('/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count,models})}); const started=await response.json(); if(!response.ok) throw new Error(started.error||'validation failed');
+    let result; for(;;){ await new Promise(resolve=>setTimeout(resolve,500)); const poll=await fetch('/validate/status?id='+encodeURIComponent(started.job_id)); const job=await poll.json(); const completed=Number(job.completed)||0,total=Number(job.total)||count,percent=Math.min(100,completed/total*100); fill.style.width=percent+'%';progressPercent.textContent=Math.round(percent)+'%';progressLabel.textContent=`${completed} of ${total} images`; if(job.state==='error') throw new Error(job.error||'validation failed'); if(job.state==='complete'){result=job.result;break;} }
+    fill.style.width='100%';progressPercent.textContent='100%';progressLabel.textContent=`${result.count} of ${result.count} images`;results.innerHTML=renderValidationResults(result);status.textContent='Complete.';
   } catch(error){status.textContent='Error: '+error.message;} finally{button.disabled=false;}
 };
 document.getElementById('run').onclick=async()=>{

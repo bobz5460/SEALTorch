@@ -3,6 +3,9 @@ import json
 import argparse
 import os
 import subprocess
+import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -11,6 +14,30 @@ TRACE = ROOT / "build" / "sealtorch_trace"
 VALIDATE = ROOT / "build" / "sealtorch_validate"
 MODEL_DIR = ROOT / "src"
 INDEX = Path(__file__).with_name("index.html")
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+def update_job(job_id, **values):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(values)
+
+
+def run_validation(job_id, command, timeout):
+    try:
+        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, bufsize=1)
+        for line in process.stderr:
+            fields = line.split()
+            if len(fields) == 3 and fields[0] == "progress":
+                update_job(job_id, completed=int(fields[1]), total=int(fields[2]))
+        stdout, _ = process.communicate(timeout=timeout)
+        if process.returncode != 0:
+            raise RuntimeError("validation executable failed")
+        update_job(job_id, state="complete", result=json.loads(stdout), completed=None)
+    except Exception as error:
+        update_job(job_id, state="error", error=str(error), completed=None)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -31,6 +58,12 @@ class Handler(BaseHTTPRequestHandler):
                 "models": models,
                 "default": "mnist_mlp_gelu_improved.json" if "mnist_mlp_gelu_improved.json" in models else (models[0] if models else ""),
             }).encode())
+        elif self.path.startswith("/validate/status"):
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            job_id = query.removeprefix("id=")
+            with JOBS_LOCK:
+                job = dict(JOBS.get(job_id, {"state": "error", "error": "unknown validation job"}))
+            self.send_bytes(200, "application/json; charset=utf-8", json.dumps(job).encode())
         else:
             self.send_bytes(404, "text/plain; charset=utf-8", b"Not found\n")
 
@@ -61,13 +94,14 @@ class Handler(BaseHTTPRequestHandler):
                 labels = dataset / "t10k-labels-idx1-ubyte"
                 if not images.exists() or not labels.exists():
                     raise RuntimeError(f"MNIST raw test files not found in {dataset}; pass --mnist-dir")
-                completed = subprocess.run(
-                    [str(VALIDATE), "--images", str(images), "--labels", str(labels),
-                     "--count", str(count), "--threads", str(self.server.max_concurrency), *model_paths],
-                    text=True, capture_output=True, timeout=max(180, count * 30), check=False)
-                if completed.returncode != 0:
-                    raise RuntimeError(completed.stderr.strip() or "validation executable failed")
-                self.send_bytes(200, "application/json; charset=utf-8", completed.stdout.encode())
+                job_id = uuid.uuid4().hex
+                with JOBS_LOCK:
+                    JOBS[job_id] = {"state": "running", "completed": 0, "total": count * len(models),
+                                    "started": time.time()}
+                command = [str(VALIDATE), "--images", str(images), "--labels", str(labels),
+                           "--count", str(count), "--threads", str(self.server.max_concurrency), *model_paths]
+                threading.Thread(target=run_validation, args=(job_id, command, max(180, count * 30)), daemon=True).start()
+                self.send_bytes(202, "application/json; charset=utf-8", json.dumps({"job_id": job_id}).encode())
                 return
             if isinstance(request, list):
                 values, model_name, activation = request, "mnist_mlp_gelu_improved.json", "gelu"
