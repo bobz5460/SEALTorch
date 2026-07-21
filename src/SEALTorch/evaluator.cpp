@@ -97,14 +97,9 @@ namespace sealtorch
         const seal::RelinKeys &relin_keys,
         const seal::GaloisKeys &galois_keys,
         seal::CKKSEncoder &encoder,
-        double scale,
-        const ProgressCallback &progress) const
+        double scale) const
     {
         std::vector<seal::Ciphertext> values;
-        std::size_t total = 0;
-        for (const auto &layer : model_.layers) total += static_cast<std::size_t>(layer.output_size);
-        std::size_t completed = 0;
-        if (progress) progress({"starting encrypted network", 0, model_.layers.size(), 0, total, 0, 0});
 
         for (int layer = 0; layer < model_.layers.size(); layer++)
         {
@@ -128,20 +123,10 @@ namespace sealtorch
                         model_.layers[layer].biases[output], evaluator,
                         encoder, scale));
                 }
-
-                ++completed;
-                if (progress) {
-                    progress({"evaluating encrypted layer", static_cast<std::size_t>(layer + 1), model_.layers.size(),
-                              completed, total, static_cast<std::size_t>(output + 1),
-                              static_cast<std::size_t>(output_width)});
-                }
             }
 
             if (layer + 1 != model_.layers.size())
             {
-                if (progress) progress({"applying encrypted activation", static_cast<std::size_t>(layer + 1),
-                                         model_.layers.size(), completed, total, 0,
-                                         static_cast<std::size_t>(next.size())});
                 for (auto &ciphertext : next)
                 {
                     ciphertext = approximate_gelu(evaluator, relin_keys, encoder, ciphertext, scale);
