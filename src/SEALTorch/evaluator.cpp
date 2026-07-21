@@ -10,7 +10,7 @@
 namespace
 {
     template <typename Function>
-    // Run at most max_concurrency jobs at a time, while preserving result order.
+
     auto parallel_map(std::size_t count, std::size_t max_concurrency, Function function)
         -> std::vector<std::invoke_result_t<Function, std::size_t>>
     {
@@ -70,10 +70,7 @@ namespace
         {
             seal::Plaintext encoded_weight;
             encoder.encode(weights[index], scale, encoded_weight);
-            // Each activation has already been rescaled. Align the encoded
-            // plaintext with that ciphertext before multiply_plain; otherwise
-            // SEAL rejects the NTT parameters as belonging to different
-            // modulus levels.
+
             evaluator.mod_switch_to_inplace(encoded_weight, input[index].parms_id());
 
             seal::Ciphertext term;
@@ -148,7 +145,6 @@ namespace sealtorch
             const auto &current_layer = model_.layers[layer];
             const std::size_t output_width = static_cast<std::size_t>(current_layer.output_size);
 
-            // Neurons in one layer are independent, so evaluate them concurrently.
             auto next = parallel_map(output_width, max_concurrency_, [&](std::size_t output) {
                 if (layer == 0)
                     return evaluate_neuron(current_layer.weights[output], input.front(),
@@ -172,7 +168,6 @@ namespace sealtorch
                 if (progress) progress({"applying encrypted activation", layer + 1,
                                          model_.layers.size(), completed, total, 0, next.size()});
 
-                // Activations are also independent, so run one async job per neuron.
                 next = parallel_map(next.size(), max_concurrency_, [&](std::size_t neuron) {
                     return approximate_gelu(evaluator, relin_keys, encoder, next[neuron], scale);
                 });
