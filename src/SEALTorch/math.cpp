@@ -4,40 +4,84 @@
 
 namespace sealtorch
 {
-    seal::Ciphertext sum_slots(
-        const seal::Ciphertext &input,
-        const seal::Evaluator &evaluator,
-        const seal::GaloisKeys &galois_keys,
-        std::size_t count)
+    seal::Ciphertext encrypted_matrix_vector_product(
+        const seal::Evaluator& evaluator,
+        const seal::GaloisKeys& galois_keys,
+        seal::CKKSEncoder& encoder,
+        const seal::Ciphertext& input,
+        const std::vector<std::vector<double>>& weights,
+        std::size_t input_width,
+        std::size_t output_width,
+        double scale)
     {
-        seal::Ciphertext result = input;
+        // Use the actual number of CKKS slots for the wraparound. This is
+        // important when the layer is smaller than the ciphertext.
+        std::size_t size = encoder.slot_count();
 
-        for (std::size_t step = 1; step < count; step *= 2)
+        // Only these rotations can contain a real input/output pair.
+        // This avoids rotating through every CKKS slot.
+        std::vector<bool> used(size, false);
+        for (std::size_t row = 0; row < output_width; ++row)
         {
+            for (std::size_t column = 0; column < input_width; ++column)
+            {
+                used[(column + size - row) % size] = true;
+            }
+        }
+
+        seal::Ciphertext result;
+        bool first = true;
+
+        for (std::size_t diagonal = 0; diagonal < size; ++diagonal)
+        {
+            if (!used[diagonal])
+            {
+                continue;
+            }
+
+            std::vector<double> values(size, 0.0);
+
+            for (std::size_t row = 0; row < output_width; ++row)
+            {
+                std::size_t column = (row + diagonal) % size;
+                if (column < input_width)
+                    values[row] = weights[row][column];
+            }
+
+            seal::Plaintext encoded;
+            encoder.encode(values, scale, encoded);
+
             seal::Ciphertext rotated;
+            if (diagonal == 0)
+            {
+                rotated = input;
+            }
+            else
+            {
+                evaluator.rotate_vector(
+                    input,
+                    static_cast<int>(diagonal),
+                    galois_keys,
+                    rotated);
+            }
 
-            evaluator.rotate_vector(
-                result,
-                static_cast<int>(step),
-                galois_keys,
-                rotated);
+            evaluator.mod_switch_to_inplace(encoded, rotated.parms_id());
 
-            evaluator.add_inplace(result, rotated);
+            seal::Ciphertext term;
+            evaluator.multiply_plain(rotated, encoded, term);
+
+            if (first)
+            {
+                result = std::move(term);
+                first = false;
+            }
+            else
+            {
+                evaluator.add_inplace(result, term);
+            }
         }
 
         return result;
-    }
-
-    seal::Ciphertext encrypted_dot_product(
-        const seal::Evaluator& evaluator,
-        const seal::GaloisKeys& galois_keys,
-        const seal::Plaintext& weights,
-        const seal::Ciphertext& input,
-        std::size_t input_width)
-    {
-        seal::Ciphertext result;
-        evaluator.multiply_plain(input, weights, result);
-        return sum_slots(result, evaluator, galois_keys, input_width);
     }
 
     seal::Ciphertext approximate_gelu(

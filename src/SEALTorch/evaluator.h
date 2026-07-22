@@ -16,8 +16,8 @@ namespace sealtorch
 
         const NeuralNetwork &model() const;
 
-        std::vector<seal::Ciphertext> predict(
-            const std::vector<seal::Ciphertext> &input,
+        seal::Ciphertext predict(
+            const seal::Ciphertext &input,
             const seal::Evaluator &evaluator,
             const seal::RelinKeys &relin_keys,
             const seal::GaloisKeys &galois_keys,
