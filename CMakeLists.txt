@@ -27,9 +27,11 @@ add_executable(sealtorch_gui src/main.cpp)
 target_compile_features(sealtorch_gui PRIVATE cxx_std_17)
 target_link_libraries(sealtorch_gui PRIVATE SEALTorch::SEALTorch X11::X11)
 
-add_executable(sealtorch_trace src/trace_main.cpp)
-target_compile_features(sealtorch_trace PRIVATE cxx_std_17)
-target_link_libraries(sealtorch_trace PRIVATE SEALTorch::SEALTorch)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/trace_main.cpp")
+    add_executable(sealtorch_trace src/trace_main.cpp)
+    target_compile_features(sealtorch_trace PRIVATE cxx_std_17)
+    target_link_libraries(sealtorch_trace PRIVATE SEALTorch::SEALTorch)
+endif()
 
 # Add your application or tests here as they are created. Keeping this file
 # small means the full SEAL source tree is never configured as part of your

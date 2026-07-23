@@ -17,12 +17,14 @@ namespace sealtorch
         const NeuralNetwork &model() const;
 
         seal::Ciphertext predict(
+            const seal::SEALContext &context,
             const seal::Ciphertext &input,
             const seal::Evaluator &evaluator,
             const seal::RelinKeys &relin_keys,
             const seal::GaloisKeys &galois_keys,
             seal::CKKSEncoder &encoder,
-            double scale) const;
+            double scale,
+            std::size_t thread_count) const;
 
     private:
         NeuralNetwork model_;

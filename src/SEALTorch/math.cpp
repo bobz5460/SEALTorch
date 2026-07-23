@@ -1,10 +1,13 @@
 #include "math.h"
 #include <cmath>
 #include <stdexcept>
+#include <thread>
+#include <algorithm>
 
 namespace sealtorch
 {
     seal::Ciphertext encrypted_matrix_vector_product(
+        const seal::SEALContext& context,
         const seal::Evaluator& evaluator,
         const seal::GaloisKeys& galois_keys,
         seal::CKKSEncoder& encoder,
@@ -12,7 +15,8 @@ namespace sealtorch
         const std::vector<std::vector<double>>& weights,
         std::size_t input_width,
         std::size_t output_width,
-        double scale)
+        double scale,
+        std::size_t thread_count)
     {
         // Use the actual number of CKKS slots for the wraparound. This is
         // important when the layer is smaller than the ciphertext.
@@ -29,55 +33,80 @@ namespace sealtorch
             }
         }
 
+        // Each diagonal is independent. Compute the terms in parallel, then
+        // add them together below in one thread.
+        std::vector<seal::Ciphertext> terms(size);
+        std::size_t diagonal_count = 0;
+        for (bool value : used)
+            if (value) ++diagonal_count;
+
+        if (thread_count == 0) thread_count = 1;
+        thread_count = std::min(thread_count, diagonal_count);
+
+        std::vector<std::thread> workers;
+        for (std::size_t worker = 0; worker < thread_count; ++worker)
+        {
+            workers.emplace_back([&, worker]() {
+                seal::Evaluator local_evaluator(context);
+                seal::CKKSEncoder local_encoder(context);
+                seal::MemoryPoolHandle pool = seal::MemoryPoolHandle::ThreadLocal();
+
+                std::size_t current = worker;
+                while (current < size)
+                {
+                    if (used[current])
+                    {
+                        std::vector<double> values(size, 0.0);
+
+                        for (std::size_t row = 0; row < output_width; ++row)
+                        {
+                            std::size_t column = (row + current) % size;
+                            if (column < input_width)
+                                values[row] = weights[row][column];
+                        }
+
+                        seal::Plaintext encoded;
+                        local_encoder.encode(values, scale, encoded, pool);
+
+                        seal::Ciphertext rotated;
+                        if (current == 0)
+                        {
+                            rotated = input;
+                        }
+                        else
+                        {
+                            local_evaluator.rotate_vector(
+                                input,
+                                static_cast<int>(current),
+                                galois_keys,
+                                rotated,
+                                pool);
+                        }
+
+                        local_evaluator.mod_switch_to_inplace(encoded, rotated.parms_id());
+
+                        local_evaluator.multiply_plain(rotated, encoded, terms[current], pool);
+                    }
+                    current += thread_count;
+                }
+            });
+        }
+
+        for (auto& worker : workers) worker.join();
+
         seal::Ciphertext result;
         bool first = true;
-
         for (std::size_t diagonal = 0; diagonal < size; ++diagonal)
         {
-            if (!used[diagonal])
-            {
-                continue;
-            }
-
-            std::vector<double> values(size, 0.0);
-
-            for (std::size_t row = 0; row < output_width; ++row)
-            {
-                std::size_t column = (row + diagonal) % size;
-                if (column < input_width)
-                    values[row] = weights[row][column];
-            }
-
-            seal::Plaintext encoded;
-            encoder.encode(values, scale, encoded);
-
-            seal::Ciphertext rotated;
-            if (diagonal == 0)
-            {
-                rotated = input;
-            }
-            else
-            {
-                evaluator.rotate_vector(
-                    input,
-                    static_cast<int>(diagonal),
-                    galois_keys,
-                    rotated);
-            }
-
-            evaluator.mod_switch_to_inplace(encoded, rotated.parms_id());
-
-            seal::Ciphertext term;
-            evaluator.multiply_plain(rotated, encoded, term);
-
+            if (!used[diagonal]) continue;
             if (first)
             {
-                result = std::move(term);
+                result = std::move(terms[diagonal]);
                 first = false;
             }
             else
             {
-                evaluator.add_inplace(result, term);
+                evaluator.add_inplace(result, terms[diagonal]);
             }
         }
 

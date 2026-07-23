@@ -22,12 +22,14 @@ namespace sealtorch
     }
 
     seal::Ciphertext Evaluator::predict(
+        const seal::SEALContext &context,
         const seal::Ciphertext &input,
         const seal::Evaluator &evaluator,
         const seal::RelinKeys &relin_keys,
         const seal::GaloisKeys &galois_keys,
         seal::CKKSEncoder &encoder,
-        double scale) const
+        double scale,
+        std::size_t thread_count) const
     {
         seal::Ciphertext values = input;
         std::size_t input_width = model_.input_size;
@@ -38,8 +40,8 @@ namespace sealtorch
             std::size_t output_width = current.output_size;
 
             seal::Ciphertext next = encrypted_matrix_vector_product(
-                evaluator, galois_keys, encoder, values,
-                current.weights, input_width, output_width, scale);
+                context, evaluator, galois_keys, encoder, values,
+                current.weights, input_width, output_width, scale, thread_count);
 
             evaluator.rescale_to_next_inplace(next);
 

@@ -10,6 +10,7 @@ namespace sealtorch
     // Computes all rows of weights * input in one packed ciphertext.
     // Input and output values use the first slots.
     seal::Ciphertext encrypted_matrix_vector_product(
+        const seal::SEALContext& context,
         const seal::Evaluator& evaluator,
         const seal::GaloisKeys& galois_keys,
         seal::CKKSEncoder& encoder,
@@ -17,7 +18,8 @@ namespace sealtorch
         const std::vector<std::vector<double>>& weights,
         std::size_t input_width,
         std::size_t output_width,
-        double scale);
+        double scale,
+        std::size_t thread_count);
 
     // Degree-four polynomial approximation of ReLU, exposed under the legacy
     // approximate_gelu name used by the evaluator. The coefficients are a
