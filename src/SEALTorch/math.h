@@ -19,7 +19,8 @@ namespace sealtorch
         std::size_t input_width,
         std::size_t output_width,
         double scale,
-        std::size_t thread_count);
+        std::size_t thread_count,
+        const std::vector<seal::Plaintext> *cached_weights);
 
     // Degree-four polynomial approximation of ReLU, exposed under the legacy
     // approximate_gelu name used by the evaluator. The coefficients are a

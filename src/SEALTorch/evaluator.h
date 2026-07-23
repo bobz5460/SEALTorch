@@ -28,5 +28,7 @@ namespace sealtorch
 
     private:
         NeuralNetwork model_;
+        mutable std::vector<std::vector<seal::Plaintext>> cached_weights_;
+        mutable std::vector<seal::parms_id_type> cached_parms_;
     };
 }

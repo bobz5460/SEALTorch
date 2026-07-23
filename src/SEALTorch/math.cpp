@@ -16,7 +16,8 @@ namespace sealtorch
         std::size_t input_width,
         std::size_t output_width,
         double scale,
-        std::size_t thread_count)
+        std::size_t thread_count,
+        const std::vector<seal::Plaintext> *cached_weights)
     {
         // Use the actual number of CKKS slots for the wraparound. This is
         // important when the layer is smaller than the ciphertext.
@@ -66,7 +67,15 @@ namespace sealtorch
                         }
 
                         seal::Plaintext encoded;
-                        local_encoder.encode(values, scale, encoded, pool);
+                        const seal::Plaintext *encoded_value = &encoded;
+                        if (cached_weights)
+                        {
+                            encoded_value = &(*cached_weights)[current];
+                        }
+                        else
+                        {
+                            local_encoder.encode(values, scale, encoded, pool);
+                        }
 
                         seal::Ciphertext rotated;
                         if (current == 0)
@@ -83,9 +92,10 @@ namespace sealtorch
                                 pool);
                         }
 
-                        local_evaluator.mod_switch_to_inplace(encoded, rotated.parms_id());
+                        if (!cached_weights)
+                            local_evaluator.mod_switch_to_inplace(encoded, rotated.parms_id());
 
-                        local_evaluator.multiply_plain(rotated, encoded, terms[current], pool);
+                        local_evaluator.multiply_plain(rotated, *encoded_value, terms[current], pool);
                     }
                     current += thread_count;
                 }

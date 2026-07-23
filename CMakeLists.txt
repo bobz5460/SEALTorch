@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.22)
 project(SEALTorch VERSION 0.1.0 LANGUAGES CXX)
 
 # SEAL is installed separately and is only a dependency of this project.
-set(SEAL_DIR "$ENV{HOME}/.local/seal/lib/cmake/SEAL-4.3" CACHE PATH
+set(SEAL_DIR "$ENV{HOME}/.local/seal-hexl/lib/cmake/SEAL-4.3" CACHE PATH
     "Directory containing SEALConfig.cmake")
 
 find_package(SEAL 4.3.3 EXACT CONFIG REQUIRED

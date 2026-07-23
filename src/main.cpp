@@ -19,6 +19,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <cstdio>
 
 // The application deliberately keeps its JSON reader local.  The JSON files
 // are model artifacts, while SEALTorch remains an independent library.
@@ -167,16 +168,100 @@ public:
         return {decoded.begin(), decoded.begin() + 10};
     }
 
+    std::vector<double> predict_plain(const std::vector<double> &input) const {
+        std::vector<double> values = input;
+        for (std::size_t layer = 0; layer < model_.model().layers.size(); ++layer) {
+            const auto &current = model_.model().layers[layer];
+            std::vector<double> next(current.output_size, 0.0);
+            for (int row = 0; row < current.output_size; ++row) {
+                next[row] = current.biases[row];
+                for (int column = 0; column < current.input_size; ++column)
+                    next[row] += current.weights[row][column] * values[column];
+                if (layer + 1 != model_.model().layers.size()) {
+                    const double x = next[row];
+                    next[row] = 0.06762090 + 0.5 * x + 0.48257484 * x * x - 0.06659632 * x * x * x * x;
+                }
+            }
+            values = std::move(next);
+        }
+        return values;
+    }
+
+    std::size_t encrypted_size(const std::vector<double> &input) const {
+        seal::Plaintext plain;
+        encoder_.encode(input, scale_, plain);
+        seal::Ciphertext encrypted;
+        encryptor_.encrypt_symmetric(plain, encrypted);
+        std::ostringstream output;
+        encrypted.save(output, seal::compr_mode_type::none);
+        return output.str().size();
+    }
+
 private:
     static seal::SEALContext make_context() {
         seal::EncryptionParameters parameters(seal::scheme_type::ckks);
         parameters.set_poly_modulus_degree(16384);
-        parameters.set_coeff_modulus(seal::CoeffModulus::Create(16384, {60, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 60}));
+        parameters.set_coeff_modulus(seal::CoeffModulus::Create(16384, {40, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 40}));
         return seal::SEALContext(parameters);
     }
     seal::SEALContext context_; seal::KeyGenerator keys_; seal::RelinKeys relin_keys_; seal::GaloisKeys galois_keys_;
-    seal::Encryptor encryptor_; seal::Evaluator evaluator_; seal::CKKSEncoder encoder_; sealtorch::Evaluator model_; std::size_t thread_count_; const double scale_ = std::pow(2.0, 30);
+    seal::Encryptor encryptor_; seal::Evaluator evaluator_; seal::CKKSEncoder encoder_; sealtorch::Evaluator model_; std::size_t thread_count_; const double scale_ = std::pow(2.0, 25);
 };
+
+static double memory_mb() {
+    std::ifstream file("/proc/self/status");
+    std::string name;
+    std::size_t value = 0;
+    while (file >> name >> value) {
+        if (name == "VmRSS:") return value / 1024.0;
+    }
+    return 0.0;
+}
+
+static void print_numbers(const std::vector<double> &values) {
+    std::cout << '[';
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) std::cout << ',';
+        std::cout << std::setprecision(12) << values[i];
+    }
+    std::cout << ']';
+}
+
+static int run_web_worker(const std::string &model_path, std::size_t thread_count) {
+    EncryptedInference inference(load_model(model_path), thread_count);
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        try {
+            const auto value = json::Parser(line).parse();
+            std::vector<double> input;
+            for (const auto &item : value.array) input.push_back(item.number);
+            if (input.size() != 784) throw std::runtime_error("expected 784 pixels");
+
+            const auto memory_before = memory_mb();
+            const auto plain_start = std::chrono::steady_clock::now();
+            const auto plain = inference.predict_plain(input);
+            const auto plain_end = std::chrono::steady_clock::now();
+            const auto encrypted_start = std::chrono::steady_clock::now();
+            const auto encrypted = inference.predict(input);
+            const auto encrypted_end = std::chrono::steady_clock::now();
+            const double plain_ms = std::chrono::duration<double, std::milli>(plain_end - plain_start).count();
+            const double encrypted_ms = std::chrono::duration<double, std::milli>(encrypted_end - encrypted_start).count();
+
+            std::cout << "{\"encrypted\":"; print_numbers(encrypted);
+            std::cout << ",\"plain\":"; print_numbers(plain);
+            std::cout << ",\"encrypted_ms\":" << encrypted_ms;
+            std::cout << ",\"plain_ms\":" << plain_ms;
+            std::cout << ",\"memory_before_mb\":" << memory_before;
+            std::cout << ",\"memory_after_mb\":" << memory_mb();
+            std::cout << ",\"ciphertext_bytes\":" << inference.encrypted_size(input);
+            std::cout << ",\"plaintext_bytes\":" << input.size() * sizeof(double) << "}\n";
+        } catch (const std::exception &error) {
+            std::cout << "{\"error\":\"" << error.what() << "\"}\n";
+        }
+        std::cout.flush();
+    }
+    return 0;
+}
 
 static void draw(Display *display, Window window, GC gc, const std::vector<unsigned char> &canvas, const std::string &status, const std::vector<double> &probabilities, const std::string &model_name)
 {
@@ -207,6 +292,12 @@ static void draw(Display *display, Window window, GC gc, const std::vector<unsig
 int main(int argc, char **argv)
 {
     try {
+        if (argc > 1 && std::string(argv[1]) == "--web-worker") {
+            const std::string model_path = argc > 2 ? argv[2] : "src/mnist_mlp.json";
+            const std::size_t thread_count = argc > 3 ? std::stoul(argv[3]) : 4;
+            if (thread_count == 0) throw std::runtime_error("thread count must be greater than zero");
+            return run_web_worker(model_path, thread_count);
+        }
         const std::string first_path = argc > 1 ? argv[1] : "src/mnist_mlp.json";
         const std::size_t thread_count = argc > 2 ? std::stoul(argv[2]) : 4;
         if (thread_count == 0) throw std::runtime_error("thread count must be greater than zero");
