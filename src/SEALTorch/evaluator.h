@@ -7,7 +7,7 @@
 
 namespace sealtorch
 {
-    enum class ExecutionMode
+    enum class Backend
     {
         Scalar,
         Packed
@@ -16,14 +16,18 @@ namespace sealtorch
     class Evaluator
     {
     public:
-        explicit Evaluator(NeuralNetwork model, ExecutionMode mode = ExecutionMode::Packed);
+        explicit Evaluator(Sequential model, Backend backend = Backend::Packed);
 
-        void set_model(NeuralNetwork model);
+        void set_model(Sequential model);
 
-        const NeuralNetwork &model() const;
+        const Sequential &model() const;
 
-        void set_mode(ExecutionMode mode);
-        ExecutionMode mode() const;
+        void set_backend(Backend backend);
+        Backend backend() const;
+
+        // Old names kept as small compatibility helpers.
+        void set_mode(Backend backend) { set_backend(backend); }
+        Backend mode() const { return backend(); }
 
         std::vector<seal::Ciphertext> predict_scalar(
             const std::vector<seal::Ciphertext> &input,
@@ -44,8 +48,8 @@ namespace sealtorch
             std::size_t thread_count) const;
 
     private:
-        NeuralNetwork model_;
-        ExecutionMode mode_;
+        Sequential model_;
+        Backend backend_;
         mutable std::vector<std::vector<seal::Plaintext>> cached_weights_;
         mutable std::vector<seal::parms_id_type> cached_parms_;
     };

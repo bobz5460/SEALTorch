@@ -36,26 +36,26 @@ namespace
 
 namespace sealtorch
 {
-    Evaluator::Evaluator(NeuralNetwork model, ExecutionMode mode) : mode_(mode)
+    Evaluator::Evaluator(Sequential model, Backend backend) : backend_(backend)
     {
         set_model(std::move(model));
     }
 
-    void Evaluator::set_model(NeuralNetwork model)
+    void Evaluator::set_model(Sequential model)
     {
         model_ = std::move(model);
         cached_weights_.clear();
         cached_parms_.clear();
     }
 
-    const NeuralNetwork &Evaluator::model() const
+    const Sequential &Evaluator::model() const
     {
         return model_;
     }
 
-    void Evaluator::set_mode(ExecutionMode mode) { mode_ = mode; }
+    void Evaluator::set_backend(Backend backend) { backend_ = backend; }
 
-    ExecutionMode Evaluator::mode() const { return mode_; }
+    Backend Evaluator::backend() const { return backend_; }
 
     std::vector<seal::Ciphertext> Evaluator::predict_scalar(
         const std::vector<seal::Ciphertext> &input,
@@ -66,9 +66,10 @@ namespace sealtorch
         double scale) const
     {
         std::vector<seal::Ciphertext> values = input;
-        for (std::size_t layer = 0; layer < model_.layers.size(); ++layer)
+        const std::vector<DenseLayer> &layers = model_.layers();
+        for (std::size_t layer = 0; layer < layers.size(); ++layer)
         {
-            const DenseLayer &current = model_.layers[layer];
+            const DenseLayer &current = layers[layer];
             std::vector<seal::Ciphertext> next;
             next.reserve(current.output_size);
             for (std::size_t output = 0; output < current.output_size; ++output)
@@ -93,7 +94,7 @@ namespace sealtorch
                         evaluator, encoder, scale));
                 }
             }
-            if (layer + 1 != model_.layers.size())
+            if (model_.has_activation(layer))
                 for (seal::Ciphertext &value : next)
                     value = approximate_gelu(evaluator, relin_keys, encoder, value, scale);
             values = std::move(next);
@@ -112,17 +113,18 @@ namespace sealtorch
         std::size_t thread_count) const
     {
         seal::Ciphertext values = input;
-        std::size_t input_width = model_.input_size;
+        std::size_t input_width = model_.input_size();
+        const std::vector<DenseLayer> &layers = model_.layers();
 
-        if (cached_weights_.size() != model_.layers.size())
+        if (cached_weights_.size() != layers.size())
         {
-            cached_weights_.resize(model_.layers.size());
-            cached_parms_.resize(model_.layers.size());
+            cached_weights_.resize(layers.size());
+            cached_parms_.resize(layers.size());
         }
 
-        for (std::size_t layer = 0; layer < model_.layers.size(); ++layer)
+        for (std::size_t layer = 0; layer < layers.size(); ++layer)
         {
-            const auto &current = model_.layers[layer];
+            const auto &current = layers[layer];
             std::size_t output_width = current.output_size;
 
             if (cached_weights_[layer].empty() || cached_parms_[layer] != values.parms_id())
@@ -166,7 +168,7 @@ namespace sealtorch
             evaluator.mod_switch_to_inplace(bias, next.parms_id());
             evaluator.add_plain_inplace(next, bias);
 
-            if (layer + 1 != model_.layers.size())
+            if (model_.has_activation(layer))
             {
                 next = approximate_gelu(
                     evaluator, relin_keys, encoder, next, scale);

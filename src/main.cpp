@@ -1,5 +1,4 @@
-#include <SEALTorch/evaluator.h>
-#include <SEALTorch/metrics.h>
+#include <SEALTorch/sealtorch.h>
 
 #include <X11/Xlib.h>
 
@@ -92,25 +91,30 @@ private:
 };
 }
 
-static NeuralNetwork load_model(const std::string &path)
+static sealtorch::Sequential load_model(const std::string &path)
 {
     std::ifstream file(path);
     if (!file) throw std::runtime_error("cannot open model: " + path);
     std::stringstream contents; contents << file.rdbuf();
     const auto root = json::Parser(contents.str()).parse();
     const auto &tensors = root.at("tensors").object;
-    NeuralNetwork model{784, 10, {}};
-    for (const auto &names : {std::pair<std::string, std::string>{"network.1.weight", "network.1.bias"},
-                              {"network.3.weight", "network.3.bias"}, {"network.5.weight", "network.5.bias"}}) {
+    sealtorch::Sequential model;
+    const std::vector<std::pair<std::string, std::string>> names_list = {
+        {"network.1.weight", "network.1.bias"},
+        {"network.3.weight", "network.3.bias"},
+        {"network.5.weight", "network.5.bias"}};
+    for (std::size_t layer_index = 0; layer_index < names_list.size(); ++layer_index) {
+        const auto &names = names_list[layer_index];
         const auto &weights = tensors.at(names.first).at("data").array;
         const auto &biases = tensors.at(names.second).at("data").array;
-        DenseLayer layer{static_cast<int>(weights.front().array.size()), static_cast<int>(weights.size()), {}, {}};
+        sealtorch::DenseLayer layer{static_cast<int>(weights.front().array.size()), static_cast<int>(weights.size()), {}, {}};
         layer.weights.resize(weights.size()); layer.biases.resize(biases.size());
         for (std::size_t output = 0; output < weights.size(); ++output) {
             for (const auto &weight : weights[output].array) layer.weights[output].push_back(weight.number);
             layer.biases[output] = biases[output].number;
         }
-        model.layers.push_back(std::move(layer));
+        model.add(sealtorch::Linear(std::move(layer)));
+        if (layer_index + 1 != names_list.size()) model.add(sealtorch::Activation::relu());
     }
     return model;
 }
@@ -150,63 +154,75 @@ static std::vector<double> softmax(const std::vector<double> &scores)
     return result;
 }
 
-class EncryptedInference
+// The demo application owns encryption and decryption. The library only sees
+// the ciphertexts passed to CiphertextModel.
+class WebInference
 {
 public:
-    EncryptedInference(const NeuralNetwork &model, std::size_t thread_count, sealtorch::ExecutionMode mode)
-        : context_(make_context()), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(model, mode), thread_count_(thread_count)
+    WebInference(const sealtorch::Sequential &model, std::size_t thread_count, sealtorch::Backend backend)
+        : context_(make_context()), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(model), thread_count_(thread_count), backend_(backend), scale_(33554432.0), ciphertext_size_(0)
     {
-        keys_.create_relin_keys(relin_keys_); keys_.create_galois_keys(galois_keys_);
+        keys_.create_relin_keys(relin_keys_);
+        keys_.create_galois_keys(galois_keys_);
         seal::Plaintext plain;
-        encoder_.encode(std::vector<double>(model.input_size, 0.0), scale_, plain);
+        encoder_.encode(std::vector<double>(model.input_size(), 0.0), scale_, plain);
         seal::Ciphertext encrypted;
         encryptor_.encrypt_symmetric(plain, encrypted);
         std::ostringstream output;
         encrypted.save(output, seal::compr_mode_type::none);
-        ciphertext_bytes_ = output.str().size();
+        ciphertext_size_ = output.str().size();
     }
 
-    std::vector<double> predict(const std::vector<double> &input) {
-        seal::Plaintext plain; encoder_.encode(input, scale_, plain);
-        seal::Ciphertext encrypted; encryptor_.encrypt_symmetric(plain, encrypted);
-        std::vector<double> output_values;
-        if (model_.mode() == sealtorch::ExecutionMode::Packed)
+    std::vector<double> predict(const std::vector<double> &input)
+    {
+        seal::Plaintext plain;
+        encoder_.encode(input, scale_, plain);
+        seal::Ciphertext encrypted;
+        encryptor_.encrypt_symmetric(plain, encrypted);
+        sealtorch::PredictionConfig config(
+            context_, evaluator_, relin_keys_, galois_keys_, encoder_,
+            scale_, backend_object(), thread_count_);
+        const std::vector<seal::Ciphertext> output = model_.predict(
+            std::vector<seal::Ciphertext>(1, encrypted), config);
+        std::vector<double> values;
+        seal::Decryptor decryptor(context_, keys_.secret_key());
+
+        if (backend_ == sealtorch::Backend::Packed)
         {
-            const auto output = model_.predict_packed(context_, encrypted, evaluator_, relin_keys_, galois_keys_, encoder_, scale_, thread_count_);
-            seal::Decryptor decryptor(context_, keys_.secret_key()); seal::Plaintext decoded_plain;
-            decryptor.decrypt(output, decoded_plain); encoder_.decode(decoded_plain, output_values);
+            seal::Plaintext decoded;
+            decryptor.decrypt(output.front(), decoded);
+            encoder_.decode(decoded, values);
         }
         else
         {
-            std::vector<seal::Ciphertext> inputs(1, encrypted);
-            const auto output = model_.predict_scalar(inputs, evaluator_, relin_keys_, galois_keys_, encoder_, scale_);
-            seal::Decryptor decryptor(context_, keys_.secret_key());
             for (const seal::Ciphertext &value : output)
             {
-                seal::Plaintext decoded_plain; decryptor.decrypt(value, decoded_plain);
-                std::vector<double> decoded; encoder_.decode(decoded_plain, decoded);
-                output_values.push_back(decoded.front());
+                seal::Plaintext decoded_plain;
+                std::vector<double> decoded;
+                decryptor.decrypt(value, decoded_plain);
+                encoder_.decode(decoded_plain, decoded);
+                values.push_back(decoded.front());
             }
         }
-        if (output_values.size() < 10) throw std::runtime_error("SEALTorch returned too few output values");
-        output_values.resize(10);
-        return output_values;
+        values.resize(static_cast<std::size_t>(model_.model().output_size()));
+        return values;
     }
 
-    void set_mode(sealtorch::ExecutionMode mode) { model_.set_mode(mode); }
-
-    std::string backend() const { return model_.mode() == sealtorch::ExecutionMode::Packed ? "packed" : "scalar"; }
-
-    std::vector<double> predict_plain(const std::vector<double> &input) const {
+    std::vector<double> predict_plain(const std::vector<double> &input) const
+    {
         std::vector<double> values = input;
-        for (std::size_t layer = 0; layer < model_.model().layers.size(); ++layer) {
-            const auto &current = model_.model().layers[layer];
+        const std::vector<sealtorch::DenseLayer> &layers = model_.model().layers();
+        for (std::size_t layer = 0; layer < layers.size(); ++layer)
+        {
+            const sealtorch::DenseLayer &current = layers[layer];
             std::vector<double> next(current.output_size, 0.0);
-            for (int row = 0; row < current.output_size; ++row) {
+            for (int row = 0; row < current.output_size; ++row)
+            {
                 next[row] = current.biases[row];
                 for (int column = 0; column < current.input_size; ++column)
                     next[row] += current.weights[row][column] * values[column];
-                if (layer + 1 != model_.model().layers.size()) {
+                if (model_.model().has_activation(layer))
+                {
                     const double x = next[row];
                     next[row] = 0.06762090 + 0.5 * x + 0.48257484 * x * x - 0.06659632 * x * x * x * x;
                 }
@@ -216,19 +232,40 @@ public:
         return values;
     }
 
-    std::size_t encrypted_size(const std::vector<double> &input) const {
-        return ciphertext_bytes_;
-    }
+    void set_backend(sealtorch::Backend backend) { backend_ = backend; }
+    std::string backend_name() const { return backend_ == sealtorch::Backend::Packed ? "packed" : "scalar"; }
+    std::size_t ciphertext_size() const { return ciphertext_size_; }
 
 private:
-    static seal::SEALContext make_context() {
+    const sealtorch::CiphertextBackend &backend_object() const
+    {
+        if (backend_ == sealtorch::Backend::Packed) return packed_backend_;
+        return scalar_backend_;
+    }
+
+    static seal::SEALContext make_context()
+    {
         seal::EncryptionParameters parameters(seal::scheme_type::ckks);
         parameters.set_poly_modulus_degree(16384);
-        parameters.set_coeff_modulus(seal::CoeffModulus::Create(16384, {40, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 40}));
+        parameters.set_coeff_modulus(seal::CoeffModulus::Create(
+            16384, {40, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 40}));
         return seal::SEALContext(parameters);
     }
-    seal::SEALContext context_; seal::KeyGenerator keys_; seal::RelinKeys relin_keys_; seal::GaloisKeys galois_keys_;
-    seal::Encryptor encryptor_; seal::Evaluator evaluator_; seal::CKKSEncoder encoder_; sealtorch::Evaluator model_; std::size_t thread_count_; std::size_t ciphertext_bytes_ = 0; const double scale_ = std::pow(2.0, 25);
+
+    seal::SEALContext context_;
+    seal::KeyGenerator keys_;
+    seal::RelinKeys relin_keys_;
+    seal::GaloisKeys galois_keys_;
+    seal::Encryptor encryptor_;
+    seal::Evaluator evaluator_;
+    seal::CKKSEncoder encoder_;
+    sealtorch::ScalarBackend scalar_backend_;
+    sealtorch::PackedBackend packed_backend_;
+    sealtorch::CiphertextModel model_;
+    std::size_t thread_count_;
+    sealtorch::Backend backend_;
+    double scale_;
+    std::size_t ciphertext_size_;
 };
 
 static double memory_mb() {
@@ -254,8 +291,8 @@ static void print_numbers(const std::vector<double> &values) {
     std::cout << ']';
 }
 
-static int run_web_worker(const std::string &model_path, std::size_t thread_count, sealtorch::ExecutionMode mode) {
-    EncryptedInference inference(load_model(model_path), thread_count, mode);
+static int run_web_worker(const std::string &model_path, std::size_t thread_count, sealtorch::Backend backend) {
+    WebInference inference(load_model(model_path), thread_count, backend);
     std::string line;
     while (std::getline(std::cin, line)) {
         try {
@@ -266,7 +303,7 @@ static int run_web_worker(const std::string &model_path, std::size_t thread_coun
             {
                 pixels = &value.at("pixels");
                 if (value.object.find("backend") != value.object.end())
-                    inference.set_mode(value.at("backend").string == "scalar" ? sealtorch::ExecutionMode::Scalar : sealtorch::ExecutionMode::Packed);
+                    inference.set_backend(value.at("backend").string == "scalar" ? sealtorch::Backend::Scalar : sealtorch::Backend::Packed);
             }
             for (const auto &item : pixels->array) input.push_back(item.number);
             if (input.size() != 784) throw std::runtime_error("expected 784 pixels");
@@ -288,9 +325,9 @@ static int run_web_worker(const std::string &model_path, std::size_t thread_coun
             std::cout << ",\"plain_ms\":" << plain_ms;
             std::cout << ",\"memory_before_mb\":" << memory_before;
             std::cout << ",\"memory_after_mb\":" << memory_mb();
-            std::cout << ",\"ciphertext_bytes\":" << inference.encrypted_size(input);
+            std::cout << ",\"ciphertext_bytes\":" << inference.ciphertext_size();
             std::cout << ",\"plaintext_bytes\":" << input.size() * sizeof(double);
-            std::cout << ",\"backend\":\"" << inference.backend() << "\"";
+            std::cout << ",\"backend\":\"" << inference.backend_name() << "\"";
             std::cout << ",\"max_abs_error\":" << comparison.maximum_absolute_error;
             std::cout << ",\"mean_abs_error\":" << comparison.mean_absolute_error;
             std::cout << ",\"different_values\":" << comparison.different_values << "}\n";
@@ -336,14 +373,14 @@ int main(int argc, char **argv)
             const std::size_t thread_count = argc > 3 ? std::stoul(argv[3]) : 4;
             if (thread_count == 0) throw std::runtime_error("thread count must be greater than zero");
             const std::string backend = argc > 4 ? argv[4] : "packed";
-            return run_web_worker(model_path, thread_count, backend == "scalar" ? sealtorch::ExecutionMode::Scalar : sealtorch::ExecutionMode::Packed);
+            return run_web_worker(model_path, thread_count, backend == "scalar" ? sealtorch::Backend::Scalar : sealtorch::Backend::Packed);
         }
         const std::string first_path = argc > 1 ? argv[1] : "src/mnist_mlp.json";
         const std::size_t thread_count = argc > 2 ? std::stoul(argv[2]) : 4;
         if (thread_count == 0) throw std::runtime_error("thread count must be greater than zero");
         const std::string second_path = first_path.find("gelu") == std::string::npos ? "src/mnist_mlp_gelu.json" : "src/mnist_mlp.json";
-        NeuralNetwork first_model = load_model(first_path);
-        std::unique_ptr<EncryptedInference> inference(new EncryptedInference(first_model, thread_count, sealtorch::ExecutionMode::Packed));
+        sealtorch::Sequential first_model = load_model(first_path);
+        std::unique_ptr<WebInference> inference(new WebInference(first_model, thread_count, sealtorch::Backend::Packed));
         Display *display = XOpenDisplay(nullptr); if (!display) throw std::runtime_error("could not open X11 display");
         const int screen = DefaultScreen(display); Window window = XCreateSimpleWindow(display, RootWindow(display, screen), 100, 100, 900, 600, 1, BlackPixel(display, screen), 0x202124);
         XStoreName(display, window, "SEALTorch - MNIST JSON demo"); XSelectInput(display, window, ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask); XMapWindow(display, window);
@@ -358,7 +395,7 @@ int main(int argc, char **argv)
             if (event.type == Expose) draw(display, window, gc, canvas, status, probabilities, model_name());
             else if (event.type == ButtonPress) {
                 if (event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 115 && event.xbutton.y < 155) { std::fill(canvas.begin(), canvas.end(), 0); probabilities.clear(); status = "Canvas cleared"; draw(display, window, gc, canvas, status, probabilities, model_name()); }
-                else if (!running && event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 170 && event.xbutton.y < 210) { first_active = !first_active; status = "Loading selected JSON model..."; draw(display, window, gc, canvas, status, probabilities, model_name()); inference.reset(new EncryptedInference(load_model(model_name()), thread_count, sealtorch::ExecutionMode::Packed)); probabilities.clear(); status = "Model loaded; draw a digit"; draw(display, window, gc, canvas, status, probabilities, model_name()); }
+                else if (!running && event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 170 && event.xbutton.y < 210) { first_active = !first_active; status = "Loading selected JSON model..."; draw(display, window, gc, canvas, status, probabilities, model_name()); inference.reset(new WebInference(load_model(model_name()), thread_count, sealtorch::Backend::Packed)); probabilities.clear(); status = "Model loaded; draw a digit"; draw(display, window, gc, canvas, status, probabilities, model_name()); }
                 else if (!running && event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 60 && event.xbutton.y < 100) { running = true; probabilities.clear(); status = "Encrypting and evaluating..."; const auto input = preprocess(canvas); task = std::async(std::launch::async, [&inference, input] { return inference->predict(input); }); draw(display, window, gc, canvas, status, probabilities, model_name()); }
                 else { drawing = true; paint(event.xbutton.x, event.xbutton.y); }
             } else if (event.type == ButtonRelease) drawing = false; else if (event.type == MotionNotify && drawing) paint(event.xmotion.x, event.xmotion.y);

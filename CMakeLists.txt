@@ -12,7 +12,8 @@ find_package(SEAL 4.3.3 EXACT CONFIG REQUIRED
 add_library(SEALTorch STATIC
     src/SEALTorch/math.cpp
     src/SEALTorch/evaluator.cpp
-    src/SEALTorch/metrics.cpp)
+    src/SEALTorch/metrics.cpp
+    src/SEALTorch/inference.cpp)
 add_library(SEALTorch::SEALTorch ALIAS SEALTorch)
 
 target_compile_features(SEALTorch PUBLIC cxx_std_17)
