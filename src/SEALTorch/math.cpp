@@ -57,15 +57,6 @@ namespace sealtorch
                 {
                     if (used[current])
                     {
-                        std::vector<double> values(size, 0.0);
-
-                        for (std::size_t row = 0; row < output_width; ++row)
-                        {
-                            std::size_t column = (row + current) % size;
-                            if (column < input_width)
-                                values[row] = weights[row][column];
-                        }
-
                         seal::Plaintext encoded;
                         const seal::Plaintext *encoded_value = &encoded;
                         if (cached_weights)
@@ -74,6 +65,13 @@ namespace sealtorch
                         }
                         else
                         {
+                            std::vector<double> values(size, 0.0);
+                            for (std::size_t row = 0; row < output_width; ++row)
+                            {
+                                std::size_t column = (row + current) % size;
+                                if (column < input_width)
+                                    values[row] = weights[row][column];
+                            }
                             local_encoder.encode(values, scale, encoded, pool);
                         }
 

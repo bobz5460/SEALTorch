@@ -156,6 +156,13 @@ public:
         : context_(make_context()), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(model), thread_count_(thread_count)
     {
         keys_.create_relin_keys(relin_keys_); keys_.create_galois_keys(galois_keys_);
+        seal::Plaintext plain;
+        encoder_.encode(std::vector<double>(model.input_size, 0.0), scale_, plain);
+        seal::Ciphertext encrypted;
+        encryptor_.encrypt_symmetric(plain, encrypted);
+        std::ostringstream output;
+        encrypted.save(output, seal::compr_mode_type::none);
+        ciphertext_bytes_ = output.str().size();
     }
 
     std::vector<double> predict(const std::vector<double> &input) {
@@ -188,13 +195,7 @@ public:
     }
 
     std::size_t encrypted_size(const std::vector<double> &input) const {
-        seal::Plaintext plain;
-        encoder_.encode(input, scale_, plain);
-        seal::Ciphertext encrypted;
-        encryptor_.encrypt_symmetric(plain, encrypted);
-        std::ostringstream output;
-        encrypted.save(output, seal::compr_mode_type::none);
-        return output.str().size();
+        return ciphertext_bytes_;
     }
 
 private:
@@ -205,7 +206,7 @@ private:
         return seal::SEALContext(parameters);
     }
     seal::SEALContext context_; seal::KeyGenerator keys_; seal::RelinKeys relin_keys_; seal::GaloisKeys galois_keys_;
-    seal::Encryptor encryptor_; seal::Evaluator evaluator_; seal::CKKSEncoder encoder_; sealtorch::Evaluator model_; std::size_t thread_count_; const double scale_ = std::pow(2.0, 25);
+    seal::Encryptor encryptor_; seal::Evaluator evaluator_; seal::CKKSEncoder encoder_; sealtorch::Evaluator model_; std::size_t thread_count_; std::size_t ciphertext_bytes_ = 0; const double scale_ = std::pow(2.0, 25);
 };
 
 static double memory_mb() {
