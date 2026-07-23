@@ -6,6 +6,34 @@
 
 namespace sealtorch
 {
+    static seal::Ciphertext sum_slots(
+        const seal::Ciphertext &input,
+        const seal::Evaluator &evaluator,
+        const seal::GaloisKeys &galois_keys,
+        std::size_t count)
+    {
+        seal::Ciphertext result = input;
+        for (std::size_t step = 1; step < count; step *= 2)
+        {
+            seal::Ciphertext rotated;
+            evaluator.rotate_vector(result, static_cast<int>(step), galois_keys, rotated);
+            evaluator.add_inplace(result, rotated);
+        }
+        return result;
+    }
+
+    seal::Ciphertext encrypted_dot_product(
+        const seal::Evaluator &evaluator,
+        const seal::GaloisKeys &galois_keys,
+        const seal::Plaintext &weights,
+        const seal::Ciphertext &input,
+        std::size_t input_width)
+    {
+        seal::Ciphertext result;
+        evaluator.multiply_plain(input, weights, result);
+        return sum_slots(result, evaluator, galois_keys, input_width);
+    }
+
     seal::Ciphertext encrypted_matrix_vector_product(
         const seal::SEALContext& context,
         const seal::Evaluator& evaluator,

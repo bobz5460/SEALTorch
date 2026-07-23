@@ -1,4 +1,5 @@
 #include <SEALTorch/evaluator.h>
+#include <SEALTorch/metrics.h>
 
 #include <X11/Xlib.h>
 
@@ -152,8 +153,8 @@ static std::vector<double> softmax(const std::vector<double> &scores)
 class EncryptedInference
 {
 public:
-    EncryptedInference(const NeuralNetwork &model, std::size_t thread_count)
-        : context_(make_context()), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(model), thread_count_(thread_count)
+    EncryptedInference(const NeuralNetwork &model, std::size_t thread_count, sealtorch::ExecutionMode mode)
+        : context_(make_context()), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(model, mode), thread_count_(thread_count)
     {
         keys_.create_relin_keys(relin_keys_); keys_.create_galois_keys(galois_keys_);
         seal::Plaintext plain;
@@ -168,12 +169,33 @@ public:
     std::vector<double> predict(const std::vector<double> &input) {
         seal::Plaintext plain; encoder_.encode(input, scale_, plain);
         seal::Ciphertext encrypted; encryptor_.encrypt_symmetric(plain, encrypted);
-        const auto output = model_.predict(context_, encrypted, evaluator_, relin_keys_, galois_keys_, encoder_, scale_, thread_count_);
-        seal::Decryptor decryptor(context_, keys_.secret_key()); seal::Plaintext decoded_plain;
-        decryptor.decrypt(output, decoded_plain); std::vector<double> decoded; encoder_.decode(decoded_plain, decoded);
-        if (decoded.size() < 10) throw std::runtime_error("SEALTorch returned too few output values");
-        return {decoded.begin(), decoded.begin() + 10};
+        std::vector<double> output_values;
+        if (model_.mode() == sealtorch::ExecutionMode::Packed)
+        {
+            const auto output = model_.predict_packed(context_, encrypted, evaluator_, relin_keys_, galois_keys_, encoder_, scale_, thread_count_);
+            seal::Decryptor decryptor(context_, keys_.secret_key()); seal::Plaintext decoded_plain;
+            decryptor.decrypt(output, decoded_plain); encoder_.decode(decoded_plain, output_values);
+        }
+        else
+        {
+            std::vector<seal::Ciphertext> inputs(1, encrypted);
+            const auto output = model_.predict_scalar(inputs, evaluator_, relin_keys_, galois_keys_, encoder_, scale_);
+            seal::Decryptor decryptor(context_, keys_.secret_key());
+            for (const seal::Ciphertext &value : output)
+            {
+                seal::Plaintext decoded_plain; decryptor.decrypt(value, decoded_plain);
+                std::vector<double> decoded; encoder_.decode(decoded_plain, decoded);
+                output_values.push_back(decoded.front());
+            }
+        }
+        if (output_values.size() < 10) throw std::runtime_error("SEALTorch returned too few output values");
+        output_values.resize(10);
+        return output_values;
     }
+
+    void set_mode(sealtorch::ExecutionMode mode) { model_.set_mode(mode); }
+
+    std::string backend() const { return model_.mode() == sealtorch::ExecutionMode::Packed ? "packed" : "scalar"; }
 
     std::vector<double> predict_plain(const std::vector<double> &input) const {
         std::vector<double> values = input;
@@ -211,10 +233,14 @@ private:
 
 static double memory_mb() {
     std::ifstream file("/proc/self/status");
-    std::string name;
-    std::size_t value = 0;
-    while (file >> name >> value) {
-        if (name == "VmRSS:") return value / 1024.0;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.find("VmRSS:") == 0) {
+            std::istringstream values(line.substr(6));
+            double kilobytes = 0.0;
+            values >> kilobytes;
+            return kilobytes / 1024.0;
+        }
     }
     return 0.0;
 }
@@ -228,14 +254,21 @@ static void print_numbers(const std::vector<double> &values) {
     std::cout << ']';
 }
 
-static int run_web_worker(const std::string &model_path, std::size_t thread_count) {
-    EncryptedInference inference(load_model(model_path), thread_count);
+static int run_web_worker(const std::string &model_path, std::size_t thread_count, sealtorch::ExecutionMode mode) {
+    EncryptedInference inference(load_model(model_path), thread_count, mode);
     std::string line;
     while (std::getline(std::cin, line)) {
         try {
             const auto value = json::Parser(line).parse();
             std::vector<double> input;
-            for (const auto &item : value.array) input.push_back(item.number);
+            const json::Value *pixels = &value;
+            if (value.kind == json::Value::Kind::object)
+            {
+                pixels = &value.at("pixels");
+                if (value.object.find("backend") != value.object.end())
+                    inference.set_mode(value.at("backend").string == "scalar" ? sealtorch::ExecutionMode::Scalar : sealtorch::ExecutionMode::Packed);
+            }
+            for (const auto &item : pixels->array) input.push_back(item.number);
             if (input.size() != 784) throw std::runtime_error("expected 784 pixels");
 
             const auto memory_before = memory_mb();
@@ -247,6 +280,7 @@ static int run_web_worker(const std::string &model_path, std::size_t thread_coun
             const auto encrypted_end = std::chrono::steady_clock::now();
             const double plain_ms = std::chrono::duration<double, std::milli>(plain_end - plain_start).count();
             const double encrypted_ms = std::chrono::duration<double, std::milli>(encrypted_end - encrypted_start).count();
+            const sealtorch::OutputComparison comparison = sealtorch::compare_outputs(plain, encrypted);
 
             std::cout << "{\"encrypted\":"; print_numbers(encrypted);
             std::cout << ",\"plain\":"; print_numbers(plain);
@@ -255,7 +289,11 @@ static int run_web_worker(const std::string &model_path, std::size_t thread_coun
             std::cout << ",\"memory_before_mb\":" << memory_before;
             std::cout << ",\"memory_after_mb\":" << memory_mb();
             std::cout << ",\"ciphertext_bytes\":" << inference.encrypted_size(input);
-            std::cout << ",\"plaintext_bytes\":" << input.size() * sizeof(double) << "}\n";
+            std::cout << ",\"plaintext_bytes\":" << input.size() * sizeof(double);
+            std::cout << ",\"backend\":\"" << inference.backend() << "\"";
+            std::cout << ",\"max_abs_error\":" << comparison.maximum_absolute_error;
+            std::cout << ",\"mean_abs_error\":" << comparison.mean_absolute_error;
+            std::cout << ",\"different_values\":" << comparison.different_values << "}\n";
         } catch (const std::exception &error) {
             std::cout << "{\"error\":\"" << error.what() << "\"}\n";
         }
@@ -297,14 +335,15 @@ int main(int argc, char **argv)
             const std::string model_path = argc > 2 ? argv[2] : "src/mnist_mlp.json";
             const std::size_t thread_count = argc > 3 ? std::stoul(argv[3]) : 4;
             if (thread_count == 0) throw std::runtime_error("thread count must be greater than zero");
-            return run_web_worker(model_path, thread_count);
+            const std::string backend = argc > 4 ? argv[4] : "packed";
+            return run_web_worker(model_path, thread_count, backend == "scalar" ? sealtorch::ExecutionMode::Scalar : sealtorch::ExecutionMode::Packed);
         }
         const std::string first_path = argc > 1 ? argv[1] : "src/mnist_mlp.json";
         const std::size_t thread_count = argc > 2 ? std::stoul(argv[2]) : 4;
         if (thread_count == 0) throw std::runtime_error("thread count must be greater than zero");
         const std::string second_path = first_path.find("gelu") == std::string::npos ? "src/mnist_mlp_gelu.json" : "src/mnist_mlp.json";
         NeuralNetwork first_model = load_model(first_path);
-        std::unique_ptr<EncryptedInference> inference(new EncryptedInference(first_model, thread_count));
+        std::unique_ptr<EncryptedInference> inference(new EncryptedInference(first_model, thread_count, sealtorch::ExecutionMode::Packed));
         Display *display = XOpenDisplay(nullptr); if (!display) throw std::runtime_error("could not open X11 display");
         const int screen = DefaultScreen(display); Window window = XCreateSimpleWindow(display, RootWindow(display, screen), 100, 100, 900, 600, 1, BlackPixel(display, screen), 0x202124);
         XStoreName(display, window, "SEALTorch - MNIST JSON demo"); XSelectInput(display, window, ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask); XMapWindow(display, window);
@@ -319,7 +358,7 @@ int main(int argc, char **argv)
             if (event.type == Expose) draw(display, window, gc, canvas, status, probabilities, model_name());
             else if (event.type == ButtonPress) {
                 if (event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 115 && event.xbutton.y < 155) { std::fill(canvas.begin(), canvas.end(), 0); probabilities.clear(); status = "Canvas cleared"; draw(display, window, gc, canvas, status, probabilities, model_name()); }
-                else if (!running && event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 170 && event.xbutton.y < 210) { first_active = !first_active; status = "Loading selected JSON model..."; draw(display, window, gc, canvas, status, probabilities, model_name()); inference.reset(new EncryptedInference(load_model(model_name()), thread_count)); probabilities.clear(); status = "Model loaded; draw a digit"; draw(display, window, gc, canvas, status, probabilities, model_name()); }
+                else if (!running && event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 170 && event.xbutton.y < 210) { first_active = !first_active; status = "Loading selected JSON model..."; draw(display, window, gc, canvas, status, probabilities, model_name()); inference.reset(new EncryptedInference(load_model(model_name()), thread_count, sealtorch::ExecutionMode::Packed)); probabilities.clear(); status = "Model loaded; draw a digit"; draw(display, window, gc, canvas, status, probabilities, model_name()); }
                 else if (!running && event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 60 && event.xbutton.y < 100) { running = true; probabilities.clear(); status = "Encrypting and evaluating..."; const auto input = preprocess(canvas); task = std::async(std::launch::async, [&inference, input] { return inference->predict(input); }); draw(display, window, gc, canvas, status, probabilities, model_name()); }
                 else { drawing = true; paint(event.xbutton.x, event.xbutton.y); }
             } else if (event.type == ButtonRelease) drawing = false; else if (event.type == MotionNotify && drawing) paint(event.xmotion.x, event.xmotion.y);

@@ -7,6 +7,13 @@
 
 namespace sealtorch
 {
+    seal::Ciphertext encrypted_dot_product(
+        const seal::Evaluator &evaluator,
+        const seal::GaloisKeys &galois_keys,
+        const seal::Plaintext &weights,
+        const seal::Ciphertext &input,
+        std::size_t input_width);
+
     // Computes all rows of weights * input in one packed ciphertext.
     // Input and output values use the first slots.
     seal::Ciphertext encrypted_matrix_vector_product(

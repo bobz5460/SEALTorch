@@ -10,8 +10,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build", "sealtorch_gui")
 MODEL = os.path.join(ROOT, "src", "mnist_mlp.json")
 THREADS = sys.argv[1] if len(sys.argv) > 1 else "4"
+BACKEND = sys.argv[2] if len(sys.argv) > 2 else "packed"
 
-worker = subprocess.Popen([BUILD, "--web-worker", MODEL, THREADS], cwd=ROOT,
+worker = subprocess.Popen([BUILD, "--web-worker", MODEL, THREADS, BACKEND], cwd=ROOT,
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           text=True, bufsize=1)
 worker_lock = threading.Lock()
@@ -51,7 +52,10 @@ class Handler(BaseHTTPRequestHandler):
             if len(pixels) != 784:
                 raise ValueError("pixels must contain 784 values")
             with worker_lock:
-                worker.stdin.write(json.dumps(pixels) + "\n")
+                backend = request.get("backend", "packed")
+                if backend not in ("packed", "scalar"):
+                    raise ValueError("backend must be packed or scalar")
+                worker.stdin.write(json.dumps({"pixels": pixels, "backend": backend}) + "\n")
                 worker.stdin.flush()
                 result = json.loads(worker.stdout.readline())
             self.send_json(result)
