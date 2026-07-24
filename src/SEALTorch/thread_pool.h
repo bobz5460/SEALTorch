@@ -35,10 +35,20 @@ namespace sealtorch
             for (std::thread &worker : workers_) worker.join();
         }
 
+        void ensure_thread_count(std::size_t thread_count)
+        {
+            thread_count = std::max<std::size_t>(1, thread_count);
+            std::lock_guard<std::mutex> lock(mutex_);
+            workers_.reserve(thread_count);
+            while (workers_.size() < thread_count)
+                workers_.emplace_back([this] { worker_loop(); });
+        }
+
         template <typename Function>
         void parallel_for(std::size_t count, std::size_t requested, Function function)
         {
             if (count == 0) return;
+            ensure_thread_count(std::min(count, std::max<std::size_t>(1, requested)));
             const std::size_t jobs = std::min({count, std::max<std::size_t>(1, requested), workers_.size()});
             std::vector<std::future<void>> futures;
             futures.reserve(jobs);
@@ -63,6 +73,7 @@ namespace sealtorch
         void parallel_for_workers(std::size_t count, std::size_t requested, Function function)
         {
             if (count == 0) return;
+            ensure_thread_count(std::min(count, std::max<std::size_t>(1, requested)));
             const std::size_t jobs = std::min({count, std::max<std::size_t>(1, requested), workers_.size()});
             std::vector<std::future<void>> futures;
             futures.reserve(jobs);
