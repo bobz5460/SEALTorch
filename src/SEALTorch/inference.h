@@ -93,48 +93,55 @@ namespace sealtorch
             const Sequential &model,
             Evaluator &evaluator,
             const std::vector<seal::Ciphertext> &input,
-            const PredictionConfig &config) const = 0;
+            const PredictionConfig &config) const;
 
         // Backends can add operations without changing the model API.
         virtual CiphertextTensor linear(
             const CiphertextTensor &input,
             const DenseLayer &layer,
+            std::size_t layer_index,
+            Evaluator &evaluator,
             const PredictionConfig &config) const;
 
         virtual CiphertextTensor activation(
             const CiphertextTensor &input,
             ActivationType type,
+            Evaluator &evaluator,
             const PredictionConfig &config) const;
 
         virtual CiphertextTensor convolution2d(
             const CiphertextTensor &input,
             const Convolution2D &layer,
+            Evaluator &evaluator,
             const PredictionConfig &config) const;
 
         virtual CiphertextTensor pool2d(
             const CiphertextTensor &input,
             const Pooling2D &layer,
+            Evaluator &evaluator,
             const PredictionConfig &config) const;
     };
 
     class ScalarBackend : public CiphertextBackend
     {
     public:
-        std::vector<seal::Ciphertext> run(
-            const Sequential &model,
-            Evaluator &evaluator,
-            const std::vector<seal::Ciphertext> &input,
-            const PredictionConfig &config) const override;
+        CiphertextTensor linear(
+            const CiphertextTensor &input, const DenseLayer &layer, std::size_t layer_index,
+            Evaluator &evaluator, const PredictionConfig &config) const override;
+        CiphertextTensor activation(
+            const CiphertextTensor &input, ActivationType type,
+            Evaluator &evaluator, const PredictionConfig &config) const override;
     };
 
     class PackedBackend : public CiphertextBackend
     {
     public:
-        std::vector<seal::Ciphertext> run(
-            const Sequential &model,
-            Evaluator &evaluator,
-            const std::vector<seal::Ciphertext> &input,
-            const PredictionConfig &config) const override;
+        CiphertextTensor linear(
+            const CiphertextTensor &input, const DenseLayer &layer, std::size_t layer_index,
+            Evaluator &evaluator, const PredictionConfig &config) const override;
+        CiphertextTensor activation(
+            const CiphertextTensor &input, ActivationType type,
+            Evaluator &evaluator, const PredictionConfig &config) const override;
     };
 
     // A custom model type can implement this small interface and keep the

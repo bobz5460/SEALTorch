@@ -1,6 +1,7 @@
 #include "inference.h"
 
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sealtorch
@@ -10,60 +11,114 @@ namespace sealtorch
         throw std::runtime_error(std::string("backend does not implement ") + name);
     }
 
+    std::vector<seal::Ciphertext> CiphertextBackend::run(
+        const Sequential &model,
+        Evaluator &evaluator,
+        const std::vector<seal::Ciphertext> &input,
+        const PredictionConfig &config) const
+    {
+        CiphertextTensor values(input, std::vector<std::size_t>(1, input.size()));
+        const std::vector<DenseLayer> &layers = model.layers();
+        for (std::size_t index = 0; index < layers.size(); ++index)
+        {
+            values = linear(values, layers[index], index, evaluator, config);
+            if (model.has_activation(index))
+                values = activation(values, model.activation(index), evaluator, config);
+        }
+        return values.values;
+    }
+
     CiphertextTensor CiphertextBackend::linear(
-        const CiphertextTensor &, const DenseLayer &, const PredictionConfig &) const
+        const CiphertextTensor &, const DenseLayer &, std::size_t,
+        Evaluator &, const PredictionConfig &) const
     {
         unsupported("linear");
         return {};
     }
 
     CiphertextTensor CiphertextBackend::activation(
-        const CiphertextTensor &, ActivationType, const PredictionConfig &) const
+        const CiphertextTensor &, ActivationType, Evaluator &,
+        const PredictionConfig &) const
     {
         unsupported("activation");
         return {};
     }
 
     CiphertextTensor CiphertextBackend::convolution2d(
-        const CiphertextTensor &, const Convolution2D &, const PredictionConfig &) const
+        const CiphertextTensor &, const Convolution2D &, Evaluator &,
+        const PredictionConfig &) const
     {
         unsupported("convolution2d");
         return {};
     }
 
     CiphertextTensor CiphertextBackend::pool2d(
-        const CiphertextTensor &, const Pooling2D &, const PredictionConfig &) const
+        const CiphertextTensor &, const Pooling2D &, Evaluator &,
+        const PredictionConfig &) const
     {
         unsupported("pool2d");
         return {};
     }
 
-    std::vector<seal::Ciphertext> ScalarBackend::run(
-        const Sequential &model,
+    CiphertextTensor ScalarBackend::linear(
+        const CiphertextTensor &input,
+        const DenseLayer &layer,
+        std::size_t,
         Evaluator &evaluator,
-        const std::vector<seal::Ciphertext> &input,
         const PredictionConfig &config) const
     {
-        return evaluator.predict_scalar(
-            input, *config.evaluator, *config.relin_keys,
-            *config.galois_keys, *config.encoder, config.scale);
+        return CiphertextTensor(
+            evaluator.linear_scalar(
+                input.values, layer, *config.evaluator,
+                *config.galois_keys, *config.encoder, config.scale),
+            std::vector<std::size_t>(1, layer.output_size));
     }
 
-    std::vector<seal::Ciphertext> PackedBackend::run(
-        const Sequential &model,
+    CiphertextTensor ScalarBackend::activation(
+        const CiphertextTensor &input,
+        ActivationType type,
         Evaluator &evaluator,
-        const std::vector<seal::Ciphertext> &input,
+        const PredictionConfig &config) const
+    {
+        return CiphertextTensor(
+            evaluator.activation(
+                input.values, type, *config.evaluator,
+                *config.relin_keys, *config.encoder, config.scale),
+            input.shape);
+    }
+
+    CiphertextTensor PackedBackend::linear(
+        const CiphertextTensor &input,
+        const DenseLayer &layer,
+        std::size_t layer_index,
+        Evaluator &evaluator,
         const PredictionConfig &config) const
     {
         if (config.context == nullptr)
             throw std::runtime_error("packed prediction needs a SEAL context");
-        if (input.size() != 1)
+        if (input.values.size() != 1)
             throw std::runtime_error("packed prediction needs one input ciphertext");
-        const seal::Ciphertext output = evaluator.predict_packed(
-            *config.context, input.front(), *config.evaluator,
-            *config.relin_keys, *config.galois_keys, *config.encoder,
+
+        std::vector<seal::Ciphertext> output(1);
+        output[0] = evaluator.linear_packed(
+            *config.context, input.values.front(), layer, layer_index,
+            *config.evaluator, *config.galois_keys, *config.encoder,
             config.scale, config.thread_count);
-        return std::vector<seal::Ciphertext>(1, output);
+        return CiphertextTensor(
+            std::move(output), std::vector<std::size_t>(1, layer.output_size));
+    }
+
+    CiphertextTensor PackedBackend::activation(
+        const CiphertextTensor &input,
+        ActivationType type,
+        Evaluator &evaluator,
+        const PredictionConfig &config) const
+    {
+        return CiphertextTensor(
+            evaluator.activation(
+                input.values, type, *config.evaluator,
+                *config.relin_keys, *config.encoder, config.scale),
+            input.shape);
     }
 
     CiphertextModel::CiphertextModel(Sequential model)
@@ -86,15 +141,13 @@ namespace sealtorch
         return config.backend->run(model(), evaluator_, input, config);
     }
 
-    const Sequential &CiphertextModel::model() const { return evaluator_.model(); }
-
     CiphertextTensor CiphertextModel::predict(
         const CiphertextTensor &input,
         const PredictionConfig &config) const
     {
         const std::vector<seal::Ciphertext> output = predict(input.values, config);
-        return CiphertextTensor(
-            output,
-            std::vector<std::size_t>(1, output.size()));
+        return CiphertextTensor(output, std::vector<std::size_t>(1, output.size()));
     }
+
+    const Sequential &CiphertextModel::model() const { return evaluator_.model(); }
 }

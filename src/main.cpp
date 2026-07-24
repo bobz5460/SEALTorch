@@ -159,8 +159,8 @@ static std::vector<double> softmax(const std::vector<double> &scores)
 class WebInference
 {
 public:
-    WebInference(const sealtorch::Sequential &model, std::size_t thread_count, sealtorch::Backend backend)
-        : context_(make_context()), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(model), thread_count_(thread_count), backend_(backend), scale_(33554432.0), ciphertext_size_(0)
+    WebInference(const sealtorch::Sequential &model, std::size_t thread_count, bool packed)
+        : context_(make_context()), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(model), thread_count_(thread_count), packed_(packed), scale_(33554432.0), ciphertext_size_(0)
     {
         keys_.create_relin_keys(relin_keys_);
         keys_.create_galois_keys(galois_keys_);
@@ -187,7 +187,7 @@ public:
         std::vector<double> values;
         seal::Decryptor decryptor(context_, keys_.secret_key());
 
-        if (backend_ == sealtorch::Backend::Packed)
+        if (packed_)
         {
             seal::Plaintext decoded;
             decryptor.decrypt(output.front(), decoded);
@@ -232,14 +232,14 @@ public:
         return values;
     }
 
-    void set_backend(sealtorch::Backend backend) { backend_ = backend; }
-    std::string backend_name() const { return backend_ == sealtorch::Backend::Packed ? "packed" : "scalar"; }
+    void set_backend(bool packed) { packed_ = packed; }
+    std::string backend_name() const { return packed_ ? "packed" : "scalar"; }
     std::size_t ciphertext_size() const { return ciphertext_size_; }
 
 private:
     const sealtorch::CiphertextBackend &backend_object() const
     {
-        if (backend_ == sealtorch::Backend::Packed) return packed_backend_;
+        if (packed_) return packed_backend_;
         return scalar_backend_;
     }
 
@@ -263,7 +263,7 @@ private:
     sealtorch::PackedBackend packed_backend_;
     sealtorch::CiphertextModel model_;
     std::size_t thread_count_;
-    sealtorch::Backend backend_;
+    bool packed_;
     double scale_;
     std::size_t ciphertext_size_;
 };
@@ -291,8 +291,8 @@ static void print_numbers(const std::vector<double> &values) {
     std::cout << ']';
 }
 
-static int run_web_worker(const std::string &model_path, std::size_t thread_count, sealtorch::Backend backend) {
-    WebInference inference(load_model(model_path), thread_count, backend);
+static int run_web_worker(const std::string &model_path, std::size_t thread_count, bool packed) {
+    WebInference inference(load_model(model_path), thread_count, packed);
     std::string line;
     while (std::getline(std::cin, line)) {
         try {
@@ -303,7 +303,7 @@ static int run_web_worker(const std::string &model_path, std::size_t thread_coun
             {
                 pixels = &value.at("pixels");
                 if (value.object.find("backend") != value.object.end())
-                    inference.set_backend(value.at("backend").string == "scalar" ? sealtorch::Backend::Scalar : sealtorch::Backend::Packed);
+                    inference.set_backend(value.at("backend").string != "scalar");
             }
             for (const auto &item : pixels->array) input.push_back(item.number);
             if (input.size() != 784) throw std::runtime_error("expected 784 pixels");
@@ -373,14 +373,14 @@ int main(int argc, char **argv)
             const std::size_t thread_count = argc > 3 ? std::stoul(argv[3]) : 4;
             if (thread_count == 0) throw std::runtime_error("thread count must be greater than zero");
             const std::string backend = argc > 4 ? argv[4] : "packed";
-            return run_web_worker(model_path, thread_count, backend == "scalar" ? sealtorch::Backend::Scalar : sealtorch::Backend::Packed);
+            return run_web_worker(model_path, thread_count, backend != "scalar");
         }
         const std::string first_path = argc > 1 ? argv[1] : "src/mnist_mlp.json";
         const std::size_t thread_count = argc > 2 ? std::stoul(argv[2]) : 4;
         if (thread_count == 0) throw std::runtime_error("thread count must be greater than zero");
         const std::string second_path = first_path.find("gelu") == std::string::npos ? "src/mnist_mlp_gelu.json" : "src/mnist_mlp.json";
         sealtorch::Sequential first_model = load_model(first_path);
-        std::unique_ptr<WebInference> inference(new WebInference(first_model, thread_count, sealtorch::Backend::Packed));
+        std::unique_ptr<WebInference> inference(new WebInference(first_model, thread_count, true));
         Display *display = XOpenDisplay(nullptr); if (!display) throw std::runtime_error("could not open X11 display");
         const int screen = DefaultScreen(display); Window window = XCreateSimpleWindow(display, RootWindow(display, screen), 100, 100, 900, 600, 1, BlackPixel(display, screen), 0x202124);
         XStoreName(display, window, "SEALTorch - MNIST JSON demo"); XSelectInput(display, window, ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask); XMapWindow(display, window);
@@ -395,7 +395,7 @@ int main(int argc, char **argv)
             if (event.type == Expose) draw(display, window, gc, canvas, status, probabilities, model_name());
             else if (event.type == ButtonPress) {
                 if (event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 115 && event.xbutton.y < 155) { std::fill(canvas.begin(), canvas.end(), 0); probabilities.clear(); status = "Canvas cleared"; draw(display, window, gc, canvas, status, probabilities, model_name()); }
-                else if (!running && event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 170 && event.xbutton.y < 210) { first_active = !first_active; status = "Loading selected JSON model..."; draw(display, window, gc, canvas, status, probabilities, model_name()); inference.reset(new WebInference(load_model(model_name()), thread_count, sealtorch::Backend::Packed)); probabilities.clear(); status = "Model loaded; draw a digit"; draw(display, window, gc, canvas, status, probabilities, model_name()); }
+                else if (!running && event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 170 && event.xbutton.y < 210) { first_active = !first_active; status = "Loading selected JSON model..."; draw(display, window, gc, canvas, status, probabilities, model_name()); inference.reset(new WebInference(load_model(model_name()), thread_count, true)); probabilities.clear(); status = "Model loaded; draw a digit"; draw(display, window, gc, canvas, status, probabilities, model_name()); }
                 else if (!running && event.xbutton.x >= kButtonLeft && event.xbutton.x < kButtonLeft + 250 && event.xbutton.y >= 60 && event.xbutton.y < 100) { running = true; probabilities.clear(); status = "Encrypting and evaluating..."; const auto input = preprocess(canvas); task = std::async(std::launch::async, [&inference, input] { return inference->predict(input); }); draw(display, window, gc, canvas, status, probabilities, model_name()); }
                 else { drawing = true; paint(event.xbutton.x, event.xbutton.y); }
             } else if (event.type == ButtonRelease) drawing = false; else if (event.type == MotionNotify && drawing) paint(event.xmotion.x, event.xmotion.y);

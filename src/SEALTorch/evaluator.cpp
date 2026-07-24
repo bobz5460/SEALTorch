@@ -2,11 +2,12 @@
 
 #include "math.h"
 
+#include <stdexcept>
 #include <utility>
 
 namespace
 {
-    seal::Ciphertext evaluate_scalar_neuron(
+    seal::Ciphertext scalar_neuron(
         const std::vector<double> &weights,
         const std::vector<seal::Ciphertext> &input,
         double bias,
@@ -17,11 +18,11 @@ namespace
         seal::Ciphertext result;
         for (std::size_t index = 0; index < weights.size(); ++index)
         {
-            seal::Plaintext encoded_weight;
-            encoder.encode(weights[index], scale, encoded_weight);
-            evaluator.mod_switch_to_inplace(encoded_weight, input[index].parms_id());
+            seal::Plaintext weight;
+            encoder.encode(weights[index], scale, weight);
+            evaluator.mod_switch_to_inplace(weight, input[index].parms_id());
             seal::Ciphertext term;
-            evaluator.multiply_plain(input[index], encoded_weight, term);
+            evaluator.multiply_plain(input[index], weight, term);
             if (index == 0) result = std::move(term);
             else evaluator.add_inplace(result, term);
         }
@@ -32,151 +33,129 @@ namespace
         evaluator.add_plain_inplace(result, encoded_bias);
         return result;
     }
+
+    seal::Ciphertext packed_neuron(
+        const sealtorch::DenseLayer &layer,
+        const std::vector<seal::Ciphertext> &input,
+        std::size_t output,
+        const seal::Evaluator &evaluator,
+        const seal::GaloisKeys &galois_keys,
+        seal::CKKSEncoder &encoder,
+        double scale)
+    {
+        seal::Plaintext weights;
+        encoder.encode(layer.weights[output], scale, weights);
+        seal::Ciphertext result = sealtorch::encrypted_dot_product(
+            evaluator, galois_keys, weights, input.front(), layer.input_size);
+        evaluator.rescale_to_next_inplace(result);
+        seal::Plaintext bias;
+        encoder.encode(layer.biases[output], result.scale(), bias);
+        evaluator.mod_switch_to_inplace(bias, result.parms_id());
+        evaluator.add_plain_inplace(result, bias);
+        return result;
+    }
 }
 
 namespace sealtorch
 {
-    Evaluator::Evaluator(Sequential model, Backend backend) : backend_(backend)
-    {
-        set_model(std::move(model));
-    }
+    Evaluator::Evaluator(Sequential model) : model_(std::move(model)) {}
 
-    void Evaluator::set_model(Sequential model)
-    {
-        model_ = std::move(model);
-        cached_weights_.clear();
-        cached_parms_.clear();
-    }
+    const Sequential &Evaluator::model() const { return model_; }
 
-    const Sequential &Evaluator::model() const
-    {
-        return model_;
-    }
-
-    void Evaluator::set_backend(Backend backend) { backend_ = backend; }
-
-    Backend Evaluator::backend() const { return backend_; }
-
-    std::vector<seal::Ciphertext> Evaluator::predict_scalar(
+    std::vector<seal::Ciphertext> Evaluator::linear_scalar(
         const std::vector<seal::Ciphertext> &input,
+        const DenseLayer &layer,
         const seal::Evaluator &evaluator,
-        const seal::RelinKeys &relin_keys,
         const seal::GaloisKeys &galois_keys,
         seal::CKKSEncoder &encoder,
         double scale) const
     {
-        std::vector<seal::Ciphertext> values = input;
-        const std::vector<DenseLayer> &layers = model_.layers();
-        for (std::size_t layer = 0; layer < layers.size(); ++layer)
+        if (input.size() == 1 && layer.input_size > 1)
         {
-            const DenseLayer &current = layers[layer];
-            std::vector<seal::Ciphertext> next;
-            next.reserve(current.output_size);
-            for (std::size_t output = 0; output < current.output_size; ++output)
-            {
-                if (layer == 0)
-                {
-                    seal::Plaintext weights;
-                    encoder.encode(current.weights[output], scale, weights);
-                    seal::Ciphertext value = encrypted_dot_product(
-                        evaluator, galois_keys, weights, values.front(), current.input_size);
-                    evaluator.rescale_to_next_inplace(value);
-                    seal::Plaintext bias;
-                    encoder.encode(current.biases[output], value.scale(), bias);
-                    evaluator.mod_switch_to_inplace(bias, value.parms_id());
-                    evaluator.add_plain_inplace(value, bias);
-                    next.push_back(std::move(value));
-                }
-                else
-                {
-                    next.push_back(evaluate_scalar_neuron(
-                        current.weights[output], values, current.biases[output],
-                        evaluator, encoder, scale));
-                }
-            }
-            if (model_.has_activation(layer))
-                for (seal::Ciphertext &value : next)
-                    value = approximate_gelu(evaluator, relin_keys, encoder, value, scale);
-            values = std::move(next);
+            std::vector<seal::Ciphertext> output;
+            for (std::size_t row = 0; row < layer.weights.size(); ++row)
+                output.push_back(packed_neuron(layer, input, row, evaluator, galois_keys, encoder, scale));
+            return output;
         }
-        return values;
+
+        std::vector<seal::Ciphertext> output;
+        for (std::size_t row = 0; row < layer.weights.size(); ++row)
+            output.push_back(scalar_neuron(
+                layer.weights[row], input, layer.biases[row], evaluator, encoder, scale));
+        return output;
     }
 
-    seal::Ciphertext Evaluator::predict_packed(
+    seal::Ciphertext Evaluator::linear_packed(
         const seal::SEALContext &context,
         const seal::Ciphertext &input,
+        const DenseLayer &layer,
+        std::size_t layer_index,
         const seal::Evaluator &evaluator,
-        const seal::RelinKeys &relin_keys,
         const seal::GaloisKeys &galois_keys,
         seal::CKKSEncoder &encoder,
         double scale,
         std::size_t thread_count) const
     {
-        seal::Ciphertext values = input;
-        std::size_t input_width = model_.input_size();
-        const std::vector<DenseLayer> &layers = model_.layers();
-
-        if (cached_weights_.size() != layers.size())
+        if (cached_weights_.size() <= layer_index)
         {
-            cached_weights_.resize(layers.size());
-            cached_parms_.resize(layers.size());
+            cached_weights_.resize(layer_index + 1);
+            cached_parms_.resize(layer_index + 1);
         }
 
-        for (std::size_t layer = 0; layer < layers.size(); ++layer)
+        const std::size_t input_width = layer.input_size;
+        const std::size_t output_width = layer.output_size;
+        if (cached_weights_[layer_index].empty() ||
+            cached_parms_[layer_index] != input.parms_id())
         {
-            const auto &current = layers[layer];
-            std::size_t output_width = current.output_size;
-
-            if (cached_weights_[layer].empty() || cached_parms_[layer] != values.parms_id())
+            const std::size_t size = encoder.slot_count();
+            cached_weights_[layer_index].resize(size);
+            for (std::size_t diagonal = 0; diagonal < size; ++diagonal)
             {
-                std::size_t size = encoder.slot_count();
-                cached_weights_[layer].resize(size);
-
-                for (std::size_t diagonal = 0; diagonal < size; ++diagonal)
+                std::vector<double> values(size, 0.0);
+                bool used = false;
+                for (std::size_t row = 0; row < output_width; ++row)
                 {
-                    std::vector<double> diagonal_values(size, 0.0);
-                    bool used = false;
-
-                    for (std::size_t row = 0; row < output_width; ++row)
+                    const std::size_t column = (row + diagonal) % size;
+                    if (column < input_width)
                     {
-                        std::size_t column = (row + diagonal) % size;
-                        if (column < input_width)
-                        {
-                            diagonal_values[row] = current.weights[row][column];
-                            used = true;
-                        }
-                    }
-
-                    if (used)
-                    {
-                        encoder.encode(diagonal_values, scale, cached_weights_[layer][diagonal]);
-                        evaluator.mod_switch_to_inplace(cached_weights_[layer][diagonal], values.parms_id());
+                        values[row] = layer.weights[row][column];
+                        used = true;
                     }
                 }
-                cached_parms_[layer] = values.parms_id();
+                if (used)
+                {
+                    encoder.encode(values, scale, cached_weights_[layer_index][diagonal]);
+                    evaluator.mod_switch_to_inplace(
+                        cached_weights_[layer_index][diagonal], input.parms_id());
+                }
             }
-
-            seal::Ciphertext next = encrypted_matrix_vector_product(
-                context, evaluator, galois_keys, encoder, values,
-                current.weights, input_width, output_width, scale, thread_count,
-                &cached_weights_[layer]);
-
-            evaluator.rescale_to_next_inplace(next);
-
-            seal::Plaintext bias;
-            encoder.encode(current.biases, next.scale(), bias);
-            evaluator.mod_switch_to_inplace(bias, next.parms_id());
-            evaluator.add_plain_inplace(next, bias);
-
-            if (model_.has_activation(layer))
-            {
-                next = approximate_gelu(
-                    evaluator, relin_keys, encoder, next, scale);
-            }
-
-            values = std::move(next);
-            input_width = output_width;
+            cached_parms_[layer_index] = input.parms_id();
         }
-        return values;
+
+        seal::Ciphertext result = encrypted_matrix_vector_product(
+            context, evaluator, galois_keys, encoder, input,
+            layer.weights, input_width, output_width, scale, thread_count,
+            &cached_weights_[layer_index]);
+        evaluator.rescale_to_next_inplace(result);
+        seal::Plaintext bias;
+        encoder.encode(layer.biases, result.scale(), bias);
+        evaluator.mod_switch_to_inplace(bias, result.parms_id());
+        evaluator.add_plain_inplace(result, bias);
+        return result;
+    }
+
+    std::vector<seal::Ciphertext> Evaluator::activation(
+        const std::vector<seal::Ciphertext> &input,
+        ActivationType type,
+        const seal::Evaluator &evaluator,
+        const seal::RelinKeys &relin_keys,
+        seal::CKKSEncoder &encoder,
+        double scale) const
+    {
+        std::vector<seal::Ciphertext> output;
+        for (const seal::Ciphertext &value : input)
+            output.push_back(approximate_gelu(
+                evaluator, relin_keys, encoder, value, scale));
+        return output;
     }
 }
