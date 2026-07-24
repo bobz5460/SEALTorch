@@ -82,8 +82,9 @@ namespace sealtorch
     {
         return CiphertextTensor(
             evaluator.activation(
-                input.values, type, *config.evaluator,
-                *config.relin_keys, *config.encoder, config.scale),
+                input.values, type, *config.context, *config.evaluator,
+                *config.relin_keys, *config.encoder, config.scale,
+                config.thread_count),
             input.shape);
     }
 
@@ -116,8 +117,9 @@ namespace sealtorch
     {
         return CiphertextTensor(
             evaluator.activation(
-                input.values, type, *config.evaluator,
-                *config.relin_keys, *config.encoder, config.scale),
+                input.values, type, *config.context, *config.evaluator,
+                *config.relin_keys, *config.encoder, config.scale,
+                config.thread_count),
             input.shape);
     }
 

@@ -3,6 +3,8 @@
 #include "math.h"
 
 #include <stdexcept>
+#include <algorithm>
+#include <thread>
 #include <utility>
 
 namespace
@@ -147,15 +149,29 @@ namespace sealtorch
     std::vector<seal::Ciphertext> Evaluator::activation(
         const std::vector<seal::Ciphertext> &input,
         ActivationType type,
+        const seal::SEALContext &context,
         const seal::Evaluator &evaluator,
         const seal::RelinKeys &relin_keys,
         seal::CKKSEncoder &encoder,
-        double scale) const
+        double scale,
+        std::size_t thread_count) const
     {
-        std::vector<seal::Ciphertext> output;
-        for (const seal::Ciphertext &value : input)
-            output.push_back(approximate_gelu(
-                evaluator, relin_keys, encoder, value, scale));
+        (void)type;
+        std::vector<seal::Ciphertext> output(input.size());
+        if (input.empty()) return output;
+        thread_count = std::max<std::size_t>(1, std::min(thread_count, input.size()));
+        std::vector<std::thread> workers;
+        for (std::size_t worker = 0; worker < thread_count; ++worker)
+        {
+            workers.emplace_back([&, worker]() {
+                seal::Evaluator local_evaluator(context);
+                seal::CKKSEncoder local_encoder(context);
+                for (std::size_t index = worker; index < input.size(); index += thread_count)
+                    output[index] = approximate_gelu(
+                        local_evaluator, relin_keys, local_encoder, input[index], scale);
+            });
+        }
+        for (std::thread &worker : workers) worker.join();
         return output;
     }
 }

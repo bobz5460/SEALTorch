@@ -37,10 +37,12 @@ namespace sealtorch
         std::vector<seal::Ciphertext> activation(
             const std::vector<seal::Ciphertext> &input,
             ActivationType type,
+            const seal::SEALContext &context,
             const seal::Evaluator &evaluator,
             const seal::RelinKeys &relin_keys,
             seal::CKKSEncoder &encoder,
-            double scale) const;
+            double scale,
+            std::size_t thread_count) const;
 
     private:
         Sequential model_;
