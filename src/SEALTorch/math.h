@@ -7,6 +7,8 @@
 
 namespace sealtorch
 {
+    class ThreadPool;
+
     seal::Ciphertext encrypted_dot_product(
         const seal::Evaluator &evaluator,
         const seal::GaloisKeys &galois_keys,
@@ -27,19 +29,22 @@ namespace sealtorch
         std::size_t output_width,
         double scale,
         std::size_t thread_count,
+        ThreadPool &thread_pool,
         const std::vector<seal::Plaintext> *cached_weights);
 
-    // Degree-four polynomial approximation of ReLU, exposed under the legacy
-    // approximate_gelu name used by the evaluator. The coefficients are a
-    // minimax fit to max(0, x) on the bounded interval [-2, 2]:
-    //
-    //   ReLU(x) ~= 0.06762090 + 0.5*x + 0.48257484*x^2 - 0.06659632*x^4
-    //
-    // This minimax fit reduces the worst-case error on [-2, 2] while using
-    // the same multiplicative depth as the old GELU approximation.
+    seal::Ciphertext approximate_relu(
+        const seal::Evaluator& evaluator,
+        const seal::RelinKeys& relin_keys,
+        seal::CKKSEncoder& encoder,
+        const seal::Ciphertext& input,
+        double scale);
 
-    // Evaluate the polynomial on a CKKS ciphertext. Accuracy is best when
-    // values entering the activation are mostly in [-2, 2]. The ciphertext
+    // Degree-four polynomial approximation of GELU. Accuracy is best when
+    // values entering the activation are mostly in [-2, 2].
+    //
+    //   GELU(x) ~= 0.5*x + 0.39894228*x^2 - 0.06649038*x^4
+    //
+    // The ciphertext
     // must have at least three rescaling levels available, and the caller's
     // scale should match the scale used to encrypt input.
     seal::Ciphertext approximate_gelu(

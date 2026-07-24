@@ -1,7 +1,7 @@
 #include "math.h"
+#include "thread_pool.h"
 #include <cmath>
 #include <stdexcept>
-#include <thread>
 #include <algorithm>
 
 namespace sealtorch
@@ -45,6 +45,7 @@ namespace sealtorch
         std::size_t output_width,
         double scale,
         std::size_t thread_count,
+        ThreadPool &thread_pool,
         const std::vector<seal::Plaintext> *cached_weights)
     {
         // Use the actual number of CKKS slots for the wraparound. This is
@@ -65,17 +66,7 @@ namespace sealtorch
         // Each diagonal is independent. Compute the terms in parallel, then
         // add them together below in one thread.
         std::vector<seal::Ciphertext> terms(size);
-        std::size_t diagonal_count = 0;
-        for (bool value : used)
-            if (value) ++diagonal_count;
-
-        if (thread_count == 0) thread_count = 1;
-        thread_count = std::min(thread_count, diagonal_count);
-
-        std::vector<std::thread> workers;
-        for (std::size_t worker = 0; worker < thread_count; ++worker)
-        {
-            workers.emplace_back([&, worker]() {
+        thread_pool.parallel_for_workers(size, thread_count, [&](std::size_t worker, std::size_t jobs) {
                 seal::Evaluator local_evaluator(context);
                 seal::CKKSEncoder local_encoder(context);
                 seal::MemoryPoolHandle pool = seal::MemoryPoolHandle::ThreadLocal();
@@ -93,7 +84,7 @@ namespace sealtorch
                         }
                         else
                         {
-                            std::vector<double> values(size, 0.0);
+                            std::vector<double> values(output_width, 0.0);
                             for (std::size_t row = 0; row < output_width; ++row)
                             {
                                 std::size_t column = (row + current) % size;
@@ -123,12 +114,9 @@ namespace sealtorch
 
                         local_evaluator.multiply_plain(rotated, *encoded_value, terms[current], pool);
                     }
-                    current += thread_count;
+                    current += jobs;
                 }
             });
-        }
-
-        for (auto& worker : workers) worker.join();
 
         seal::Ciphertext result;
         bool first = true;
@@ -149,21 +137,17 @@ namespace sealtorch
         return result;
     }
 
-    seal::Ciphertext approximate_gelu(
+    static seal::Ciphertext approximate_polynomial(
         const seal::Evaluator& evaluator,
         const seal::RelinKeys& relin_keys,
         seal::CKKSEncoder& encoder,
         const seal::Ciphertext& input,
-        double scale)
+        double scale,
+        double constant,
+        double linear,
+        double quadratic,
+        double quartic)
     {
-
-        // Minimax degree-four ReLU fit on [-2, 2]. The constant term lowers
-        // the worst-case approximation error without adding multiplicative
-        // depth; it is added at the deepest ciphertext level below.
-        constexpr double constant = 0.06762090;
-        constexpr double linear = 0.5;
-        constexpr double quadratic = 0.48257484;
-        constexpr double quartic = -0.06659632;
 
         // x^2 and x^4 are the only ciphertext-ciphertext products. Each is
         // relinearized and rescaled before it is used in another operation.
@@ -220,6 +204,30 @@ namespace sealtorch
         evaluator.add_inplace(quartic_term, quadratic_term);
         evaluator.add_inplace(quartic_term, linear_term);
         return quartic_term;
+    }
+
+    seal::Ciphertext approximate_relu(
+        const seal::Evaluator& evaluator,
+        const seal::RelinKeys& relin_keys,
+        seal::CKKSEncoder& encoder,
+        const seal::Ciphertext& input,
+        double scale)
+    {
+        return approximate_polynomial(
+            evaluator, relin_keys, encoder, input, scale,
+            0.06762090, 0.5, 0.48257484, -0.06659632);
+    }
+
+    seal::Ciphertext approximate_gelu(
+        const seal::Evaluator& evaluator,
+        const seal::RelinKeys& relin_keys,
+        seal::CKKSEncoder& encoder,
+        const seal::Ciphertext& input,
+        double scale)
+    {
+        return approximate_polynomial(
+            evaluator, relin_keys, encoder, input, scale,
+            0.0, 0.5, 0.3989422804014327, -0.0664903800669054);
     }
 
 }

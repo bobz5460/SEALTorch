@@ -2,6 +2,7 @@
 
 #include <seal/seal.h>
 #include <SEALTorch/model.h>
+#include <SEALTorch/thread_pool.h>
 
 #include <cstddef>
 #include <vector>
@@ -48,5 +49,7 @@ namespace sealtorch
         Sequential model_;
         mutable std::vector<std::vector<seal::Plaintext>> cached_weights_;
         mutable std::vector<seal::parms_id_type> cached_parms_;
+        mutable ThreadPool thread_pool_{
+            std::min<std::size_t>(8, std::max<std::size_t>(1, std::thread::hardware_concurrency()))};
     };
 }

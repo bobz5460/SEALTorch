@@ -111,25 +111,24 @@ namespace sealtorch
         {
             const std::size_t size = encoder.slot_count();
             cached_weights_[layer_index].resize(size);
+            std::vector<bool> used(size, false);
+            for (std::size_t row = 0; row < output_width; ++row)
+                for (std::size_t column = 0; column < input_width; ++column)
+                    used[(column + size - row) % size] = true;
+
             for (std::size_t diagonal = 0; diagonal < size; ++diagonal)
             {
-                std::vector<double> values(size, 0.0);
-                bool used = false;
+                if (!used[diagonal]) continue;
+                std::vector<double> values(output_width, 0.0);
                 for (std::size_t row = 0; row < output_width; ++row)
                 {
                     const std::size_t column = (row + diagonal) % size;
                     if (column < input_width)
-                    {
                         values[row] = layer.weights[row][column];
-                        used = true;
-                    }
                 }
-                if (used)
-                {
-                    encoder.encode(values, scale, cached_weights_[layer_index][diagonal]);
-                    evaluator.mod_switch_to_inplace(
-                        cached_weights_[layer_index][diagonal], input.parms_id());
-                }
+                encoder.encode(values, scale, cached_weights_[layer_index][diagonal]);
+                evaluator.mod_switch_to_inplace(
+                    cached_weights_[layer_index][diagonal], input.parms_id());
             }
             cached_parms_[layer_index] = input.parms_id();
         }
@@ -137,6 +136,7 @@ namespace sealtorch
         seal::Ciphertext result = encrypted_matrix_vector_product(
             context, evaluator, galois_keys, encoder, input,
             layer.weights, input_width, output_width, scale, thread_count,
+            thread_pool_,
             &cached_weights_[layer_index]);
         evaluator.rescale_to_next_inplace(result);
         seal::Plaintext bias;
@@ -156,22 +156,16 @@ namespace sealtorch
         double scale,
         std::size_t thread_count) const
     {
-        (void)type;
         std::vector<seal::Ciphertext> output(input.size());
         if (input.empty()) return output;
-        thread_count = std::max<std::size_t>(1, std::min(thread_count, input.size()));
-        std::vector<std::thread> workers;
-        for (std::size_t worker = 0; worker < thread_count; ++worker)
-        {
-            workers.emplace_back([&, worker]() {
+        thread_pool_.parallel_for_workers(input.size(), thread_count, [&](std::size_t worker, std::size_t jobs) {
                 seal::Evaluator local_evaluator(context);
                 seal::CKKSEncoder local_encoder(context);
-                for (std::size_t index = worker; index < input.size(); index += thread_count)
-                    output[index] = approximate_gelu(
-                        local_evaluator, relin_keys, local_encoder, input[index], scale);
+                for (std::size_t index = worker; index < input.size(); index += jobs)
+                    output[index] = type == ActivationType::Relu
+                        ? approximate_relu(local_evaluator, relin_keys, local_encoder, input[index], scale)
+                        : approximate_gelu(local_evaluator, relin_keys, local_encoder, input[index], scale);
             });
-        }
-        for (std::thread &worker : workers) worker.join();
         return output;
     }
 }

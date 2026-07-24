@@ -154,6 +154,13 @@ static std::vector<double> softmax(const std::vector<double> &scores)
     return result;
 }
 
+static double activate(double value, sealtorch::ActivationType type)
+{
+    if (type == sealtorch::ActivationType::Relu)
+        return 0.06762090 + 0.5 * value + 0.48257484 * value * value - 0.06659632 * value * value * value * value;
+    return 0.5 * value + 0.3989422804014327 * value * value - 0.0664903800669054 * value * value * value * value;
+}
+
 // The demo application owns encryption and decryption. The library only sees
 // the ciphertexts passed to CiphertextModel.
 class WebInference
@@ -222,10 +229,7 @@ public:
                 for (int column = 0; column < current.input_size; ++column)
                     next[row] += current.weights[row][column] * values[column];
                 if (model_.model().has_activation(layer))
-                {
-                    const double x = next[row];
-                    next[row] = 0.06762090 + 0.5 * x + 0.48257484 * x * x - 0.06659632 * x * x * x * x;
-                }
+                    next[row] = activate(next[row], model_.model().activation(layer));
             }
             values = std::move(next);
         }
