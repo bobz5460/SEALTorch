@@ -18,12 +18,32 @@ namespace sealtorch
         const PredictionConfig &config) const
     {
         CiphertextTensor values(input, std::vector<std::size_t>(1, input.size()));
-        const std::vector<DenseLayer> &layers = model.layers();
-        for (std::size_t index = 0; index < layers.size(); ++index)
+        std::size_t dense_index = 0;
+        for (const Operation &operation : model.operations())
         {
-            values = linear(values, layers[index], index, evaluator, config);
-            if (model.has_activation(index))
-                values = activation(values, model.activation(index), evaluator, config);
+            switch (operation.kind)
+            {
+            case OperationKind::Linear:
+                values = linear(values, std::any_cast<const DenseLayer &>(operation.payload),
+                                dense_index++, evaluator, config);
+                break;
+            case OperationKind::Activation:
+                values = activation(values, std::any_cast<ActivationType>(operation.payload), evaluator, config);
+                break;
+            case OperationKind::Convolution2D:
+                values = convolution2d(values, std::any_cast<const Convolution2D &>(operation.payload), evaluator, config);
+                break;
+            case OperationKind::Pooling2D:
+                values = pool2d(values, std::any_cast<const Pooling2D &>(operation.payload), evaluator, config);
+                break;
+            case OperationKind::Flatten:
+                // Flatten changes interpretation, not ciphertext contents.
+                values.shape = operation.output_shape.empty() ?
+                    std::vector<std::size_t>{values.values.size()} : operation.output_shape;
+                break;
+            case OperationKind::Custom:
+                throw std::runtime_error("backend does not implement custom operation: " + operation.name);
+            }
         }
         return values.values;
     }

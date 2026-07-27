@@ -24,32 +24,6 @@ namespace sealtorch
         }
     };
 
-    struct Convolution2D
-    {
-        std::vector<double> weights;
-        std::vector<double> biases;
-        std::size_t input_channels = 0;
-        std::size_t output_channels = 0;
-        std::size_t kernel_height = 0;
-        std::size_t kernel_width = 0;
-        std::size_t stride = 1;
-        std::size_t padding = 0;
-    };
-
-    enum class PoolingType
-    {
-        Average,
-        Maximum
-    };
-
-    struct Pooling2D
-    {
-        PoolingType type = PoolingType::Average;
-        std::size_t height = 2;
-        std::size_t width = 2;
-        std::size_t stride = 2;
-    };
-
     struct PredictionConfig
     {
         std::size_t thread_count = 4;
