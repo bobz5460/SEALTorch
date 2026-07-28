@@ -150,7 +150,18 @@ static int run_web_worker() {
     std::unique_ptr<WebInference> inference; std::string active_model; RunConfig active_config; std::string line;
     while (std::getline(std::cin, line)) try {
         const auto request = json::Parser(line).parse(); const auto &pixels = request.at("pixels"); if (pixels.array.size() != 784) throw std::runtime_error("pixels must contain 784 values"); std::vector<double> input; for (const auto &item : pixels.array) input.push_back(item.number);
-        const RunConfig config = parse_config(request); const std::string &selected_model = model_path(request); const bool rebuild = !inference || config != active_config || selected_model != active_model; const auto setup_start = std::chrono::steady_clock::now(); if (rebuild) { inference = std::make_unique<WebInference>(load_model(selected_model), config); active_config = config; active_model = selected_model; } const double setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count();
+        const RunConfig config = parse_config(request); const std::string &selected_model = model_path(request); const bool rebuild = !inference || config != active_config || selected_model != active_model;
+        double setup_ms = 0.0;
+        if (rebuild) {
+            const auto setup_start = std::chrono::steady_clock::now();
+            inference = std::make_unique<WebInference>(load_model(selected_model), config);
+            // FIDES/CUDA may lazily load model data and kernels on the first
+            // prediction.  Run that work before measuring a benchmark sample.
+            inference->predict(input);
+            active_config = config;
+            active_model = selected_model;
+            setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count();
+        }
         const double memory_before = memory_mb(); const auto encrypted = inference->predict(input);
         std::cout << "{\"encrypted\":"; print_numbers(encrypted.values); std::cout << ",\"setup_ms\":" << setup_ms << ",\"encrypt_ms\":" << encrypted.encrypt_ms << ",\"evaluate_ms\":" << encrypted.evaluate_ms << ",\"decrypt_ms\":" << encrypted.decrypt_ms << ",\"encrypted_ms\":" << encrypted.encrypt_ms + encrypted.evaluate_ms + encrypted.decrypt_ms << ",\"memory_before_mb\":" << memory_before << ",\"memory_after_mb\":" << memory_mb() << ",\"input_ciphertext_bytes\":" << encrypted.input_bytes << ",\"output_ciphertext_bytes\":" << encrypted.output_bytes << ",\"backend\":\"" << (config.packed ? "packed" : "scalar") << "\"}\n";
     } catch (const std::exception &error) { std::cout << "{\"error\":\"" << error.what() << "\"}\n"; }

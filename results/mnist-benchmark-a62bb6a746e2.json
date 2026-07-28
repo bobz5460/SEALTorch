@@ -1,0 +1,272 @@
+{
+  "id": "a62bb6a746e2",
+  "created_at": "2026-07-28T17:38:48.370421+00:00",
+  "finished_at": "2026-07-28T17:39:16.225865+00:00",
+  "config": {
+    "engine": "he",
+    "device": "auto",
+    "model": "relu",
+    "backend": "packed",
+    "threads": "4",
+    "ring_dim": "16384",
+    "depth": "15",
+    "scaling_mod_bits": "40",
+    "first_mod_bits": "50",
+    "scale_bits": "25"
+  },
+  "samples": 10,
+  "batch_size": 32,
+  "selection": {
+    "start_index": 0,
+    "stride": 1,
+    "shuffle_seed": null
+  },
+  "accuracy": 0.3,
+  "mean_latency_ms": 408.334659,
+  "p50_latency_ms": 407.341863,
+  "p95_latency_ms": 428.662859,
+  "initialization_ms": 18321.285047980793,
+  "initialization_events": 1,
+  "throughput_per_s": 0.37780741876312524,
+  "confusion_matrix": [
+    [
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      1,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      1,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  ],
+  "per_digit_accuracy": [
+    0.0,
+    0.5,
+    0.0,
+    null,
+    1.0,
+    0.0,
+    null,
+    0.0,
+    null,
+    0.0
+  ],
+  "latency_ms": [
+    407.341863,
+    401.288424,
+    425.879839,
+    386.636517,
+    423.310748,
+    392.862447,
+    395.472493,
+    406.655813,
+    415.235587,
+    428.662859
+  ],
+  "setup_ms": [
+    18321.285047980793,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "predictions": [
+    {
+      "index": 0,
+      "label": 7,
+      "prediction": 4,
+      "latency_ms": 407.341863,
+      "setup_ms": 18321.285047980793
+    },
+    {
+      "index": 1,
+      "label": 2,
+      "prediction": 1,
+      "latency_ms": 401.288424,
+      "setup_ms": 0
+    },
+    {
+      "index": 2,
+      "label": 1,
+      "prediction": 1,
+      "latency_ms": 425.879839,
+      "setup_ms": 0
+    },
+    {
+      "index": 3,
+      "label": 0,
+      "prediction": 1,
+      "latency_ms": 386.636517,
+      "setup_ms": 0
+    },
+    {
+      "index": 4,
+      "label": 4,
+      "prediction": 4,
+      "latency_ms": 423.310748,
+      "setup_ms": 0
+    },
+    {
+      "index": 5,
+      "label": 1,
+      "prediction": 4,
+      "latency_ms": 392.862447,
+      "setup_ms": 0
+    },
+    {
+      "index": 6,
+      "label": 4,
+      "prediction": 4,
+      "latency_ms": 395.472493,
+      "setup_ms": 0
+    },
+    {
+      "index": 7,
+      "label": 9,
+      "prediction": 1,
+      "latency_ms": 406.655813,
+      "setup_ms": 0
+    },
+    {
+      "index": 8,
+      "label": 5,
+      "prediction": 4,
+      "latency_ms": 415.235587,
+      "setup_ms": 0
+    },
+    {
+      "index": 9,
+      "label": 9,
+      "prediction": 4,
+      "latency_ms": 428.662859,
+      "setup_ms": 0
+    }
+  ],
+  "telemetry": {
+    "gpu_power_w": 589.895,
+    "cpu_power_w": null,
+    "gpu_energy_j": 15613.642578306482,
+    "cpu_energy_j": null,
+    "total_energy_j": 15613.642578306482,
+    "total_power_w": 589.895,
+    "wall_ms": 26468.511477985885,
+    "gpu_energy_method": "two-point power estimate",
+    "cpu_energy_method": null
+  }
+}
