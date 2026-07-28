@@ -1,4 +1,4 @@
-#include <SEALTorch/fides_inference.h>
+#include <SEALTorch/cuda_ciphertext_inference.h>
 
 #include <cuda_runtime_api.h>
 
@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace sealtorch::fides
+namespace sealtorch::cuda
 {
     namespace
     {
@@ -115,15 +115,15 @@ namespace sealtorch::fides
         return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
     }
 
-    struct InferenceEngine::Implementation
+    struct CiphertextInferenceEngine::Implementation
     {
         Sequential model;
-        Options options;
+        CiphertextInferenceOptions options;
         Context context;
         fideslib::KeyPair<fideslib::DCRTPoly> keys;
         std::vector<PackedLayer> layers;
 
-        Implementation(Sequential model_value, Options options_value)
+        Implementation(Sequential model_value, CiphertextInferenceOptions options_value)
             : model(std::move(model_value)), options(std::move(options_value))
         {
             const std::vector<DenseLayer> &dense_layers = model.layers();
@@ -187,11 +187,11 @@ namespace sealtorch::fides
         }
     };
 
-    InferenceEngine::InferenceEngine(Sequential model, Options options)
+    CiphertextInferenceEngine::CiphertextInferenceEngine(Sequential model, CiphertextInferenceOptions options)
         : implementation_(std::make_unique<Implementation>(std::move(model), std::move(options))) {}
-    InferenceEngine::~InferenceEngine() = default;
-    InferenceEngine::InferenceEngine(InferenceEngine &&) noexcept = default;
-    InferenceEngine &InferenceEngine::operator=(InferenceEngine &&) noexcept = default;
-    std::vector<double> InferenceEngine::predict(const std::vector<double> &input) { return implementation_->predict(input); }
-    std::size_t InferenceEngine::slot_count() const { return implementation_->slot_count(); }
+    CiphertextInferenceEngine::~CiphertextInferenceEngine() = default;
+    CiphertextInferenceEngine::CiphertextInferenceEngine(CiphertextInferenceEngine &&) noexcept = default;
+    CiphertextInferenceEngine &CiphertextInferenceEngine::operator=(CiphertextInferenceEngine &&) noexcept = default;
+    std::vector<double> CiphertextInferenceEngine::predict(const std::vector<double> &input) { return implementation_->predict(input); }
+    std::size_t CiphertextInferenceEngine::slot_count() const { return implementation_->slot_count(); }
 }

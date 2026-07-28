@@ -11,12 +11,13 @@ namespace sealtorch
     // Native ciphertexts are provider-specific. This API deliberately owns
     // them, so callers can switch providers without changing their inference
     // flow or accidentally mixing incompatible ciphertext formats.
-    enum class InferenceProvider { Auto, CPU, CUDA };
+    // Selects where native homomorphic-encryption operations run.
+    enum class ExecutionTarget { Auto, CPU, CUDA };
     enum class CiphertextLayout { Packed, Scalar };
 
-    struct EncryptedInferenceOptions
+    struct CiphertextInferenceOptions
     {
-        InferenceProvider provider = InferenceProvider::Auto;
+        ExecutionTarget target = ExecutionTarget::Auto;
         CiphertextLayout layout = CiphertextLayout::Packed;
         std::size_t thread_count = 4;
         std::size_t ring_dimension = 16384;
@@ -27,7 +28,7 @@ namespace sealtorch
         int cuda_device = 0;
     };
 
-    struct EncryptedInferenceResult
+    struct CiphertextInferenceResult
     {
         std::vector<double> values;
         double encrypt_ms = 0.0;
@@ -40,18 +41,18 @@ namespace sealtorch
     // One encrypt -> evaluate -> decrypt API for Microsoft SEAL (CPU) and
     // FIDESlib (CUDA). Add model operations to native backends while keeping
     // application code independent of the selected HE provider.
-    class EncryptedInference
+    class CiphertextInference
     {
     public:
-        EncryptedInference(Sequential model, EncryptedInferenceOptions options = {});
-        ~EncryptedInference();
-        EncryptedInference(EncryptedInference &&) noexcept;
-        EncryptedInference &operator=(EncryptedInference &&) noexcept;
-        EncryptedInference(const EncryptedInference &) = delete;
-        EncryptedInference &operator=(const EncryptedInference &) = delete;
+        CiphertextInference(Sequential model, CiphertextInferenceOptions options = {});
+        ~CiphertextInference();
+        CiphertextInference(CiphertextInference &&) noexcept;
+        CiphertextInference &operator=(CiphertextInference &&) noexcept;
+        CiphertextInference(const CiphertextInference &) = delete;
+        CiphertextInference &operator=(const CiphertextInference &) = delete;
 
-        EncryptedInferenceResult predict(const std::vector<double> &input);
-        InferenceProvider provider() const;
+        CiphertextInferenceResult predict(const std::vector<double> &input);
+        ExecutionTarget target() const;
         static bool cuda_available();
 
     private:

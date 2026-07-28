@@ -1,4 +1,4 @@
-#include "inference.h"
+#include "seal_ciphertext_backend.h"
 
 #include <stdexcept>
 #include <string>

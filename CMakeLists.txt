@@ -16,9 +16,9 @@ add_library(SEALTorch STATIC
     src/SEALTorch/math.cpp
     src/SEALTorch/evaluator.cpp
     src/SEALTorch/metrics.cpp
-    src/SEALTorch/inference.cpp
-    src/SEALTorch/encrypted_inference.cpp
-    src/SEALTorch/fides_inference.cpp)
+    src/SEALTorch/seal_ciphertext_backend.cpp
+    src/SEALTorch/ciphertext_inference.cpp
+    src/SEALTorch/cuda_ciphertext_inference.cpp)
 add_library(SEALTorch::SEALTorch ALIAS SEALTorch)
 
 target_compile_features(SEALTorch PUBLIC cxx_std_20)

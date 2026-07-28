@@ -1,7 +1,7 @@
-#include <SEALTorch/encrypted_inference.h>
+#include <SEALTorch/ciphertext_inference.h>
 
-#include <SEALTorch/fides_inference.h>
-#include <SEALTorch/inference.h>
+#include <SEALTorch/cuda_ciphertext_inference.h>
+#include <SEALTorch/seal_ciphertext_backend.h>
 
 #include <algorithm>
 #include <chrono>
@@ -14,7 +14,7 @@ namespace sealtorch
 {
     namespace
     {
-        std::size_t ciphertext_bytes(const EncryptedInferenceOptions &options)
+        std::size_t ciphertext_bytes(const CiphertextInferenceOptions &options)
         {
             // A provider-neutral coefficient-storage estimate. Native
             // serialized ciphertexts differ, so reporting one common metric
@@ -22,11 +22,11 @@ namespace sealtorch
             return 2 * options.ring_dimension * (options.multiplicative_depth + 1) * sizeof(std::uint64_t);
         }
 
-        seal::SEALContext make_cpu_context(const EncryptedInferenceOptions &options)
+        seal::SEALContext make_cpu_context(const CiphertextInferenceOptions &options)
         {
             if (options.ring_dimension < 1024 || (options.ring_dimension & (options.ring_dimension - 1)) ||
                 options.multiplicative_depth == 0 || options.scale_bits == 0)
-                throw std::runtime_error("invalid encrypted inference options");
+                throw std::runtime_error("invalid ciphertext inference options");
             seal::EncryptionParameters parameters(seal::scheme_type::ckks);
             parameters.set_poly_modulus_degree(options.ring_dimension);
             std::vector<int> modulus_bits(options.multiplicative_depth, static_cast<int>(options.scale_bits));
@@ -38,10 +38,10 @@ namespace sealtorch
             return context;
         }
 
-        class CpuInference
+        class CpuCiphertextInference
         {
         public:
-            CpuInference(Sequential model, EncryptedInferenceOptions options)
+            CpuCiphertextInference(Sequential model, CiphertextInferenceOptions options)
                 : options_(std::move(options)), context_(make_cpu_context(options_)), keys_(context_),
                   encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_),
                   model_(std::move(model)), scale_(std::ldexp(1.0, static_cast<int>(options_.scale_bits)))
@@ -58,9 +58,9 @@ namespace sealtorch
                 keys_.create_galois_keys(rotations, galois_keys_);
             }
 
-            EncryptedInferenceResult predict(const std::vector<double> &input)
+            CiphertextInferenceResult predict(const std::vector<double> &input)
             {
-                EncryptedInferenceResult result;
+                CiphertextInferenceResult result;
                 const auto encrypt_start = std::chrono::steady_clock::now();
                 seal::Plaintext plain;
                 encoder_.encode(input, scale_, plain);
@@ -104,7 +104,7 @@ namespace sealtorch
             }
 
         private:
-            EncryptedInferenceOptions options_;
+            CiphertextInferenceOptions options_;
             seal::SEALContext context_;
             seal::KeyGenerator keys_;
             seal::RelinKeys relin_keys_;
@@ -119,39 +119,39 @@ namespace sealtorch
         };
     }
 
-    struct EncryptedInference::Implementation
+    struct CiphertextInference::Implementation
     {
-        InferenceProvider provider;
-        std::unique_ptr<CpuInference> cpu;
-        std::unique_ptr<fides::InferenceEngine> cuda;
-        EncryptedInferenceOptions options;
+        ExecutionTarget target;
+        std::unique_ptr<CpuCiphertextInference> cpu_inference;
+        std::unique_ptr<cuda::CiphertextInferenceEngine> cuda_engine;
+        CiphertextInferenceOptions options;
 
-        Implementation(Sequential model, EncryptedInferenceOptions options_value)
+        Implementation(Sequential model, CiphertextInferenceOptions options_value)
             : options(std::move(options_value))
         {
             if (options.thread_count == 0)
                 throw std::runtime_error("thread count must be greater than zero");
-            provider = options.provider == InferenceProvider::Auto
-                ? (fides::cuda_available() ? InferenceProvider::CUDA : InferenceProvider::CPU)
-                : options.provider;
-            if (provider == InferenceProvider::CUDA)
+            target = options.target == ExecutionTarget::Auto
+                ? (cuda::cuda_available() ? ExecutionTarget::CUDA : ExecutionTarget::CPU)
+                : options.target;
+            if (target == ExecutionTarget::CUDA)
             {
                 if (options.layout != CiphertextLayout::Packed)
                     throw std::runtime_error("CUDA encrypted inference currently supports packed ciphertexts only");
-                cuda = std::make_unique<fides::InferenceEngine>(std::move(model), fides::Options{
+                cuda_engine = std::make_unique<cuda::CiphertextInferenceEngine>(std::move(model), cuda::CiphertextInferenceOptions{
                     options.ring_dimension, options.multiplicative_depth, options.scaling_modulus_bits,
                     options.first_modulus_bits, options.cuda_device});
             }
             else
-                cpu = std::make_unique<CpuInference>(std::move(model), options);
+                cpu_inference = std::make_unique<CpuCiphertextInference>(std::move(model), options);
         }
 
-        EncryptedInferenceResult predict(const std::vector<double> &input)
+        CiphertextInferenceResult predict(const std::vector<double> &input)
         {
-            if (cpu) return cpu->predict(input);
+            if (cpu_inference) return cpu_inference->predict(input);
             const auto started = std::chrono::steady_clock::now();
-            EncryptedInferenceResult result;
-            result.values = cuda->predict(input);
+            CiphertextInferenceResult result;
+            result.values = cuda_engine->predict(input);
             result.evaluate_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             result.input_ciphertext_bytes = ciphertext_bytes(options);
             result.output_ciphertext_bytes = ciphertext_bytes(options);
@@ -159,12 +159,12 @@ namespace sealtorch
         }
     };
 
-    EncryptedInference::EncryptedInference(Sequential model, EncryptedInferenceOptions options)
+    CiphertextInference::CiphertextInference(Sequential model, CiphertextInferenceOptions options)
         : implementation_(std::make_unique<Implementation>(std::move(model), std::move(options))) {}
-    EncryptedInference::~EncryptedInference() = default;
-    EncryptedInference::EncryptedInference(EncryptedInference &&) noexcept = default;
-    EncryptedInference &EncryptedInference::operator=(EncryptedInference &&) noexcept = default;
-    EncryptedInferenceResult EncryptedInference::predict(const std::vector<double> &input) { return implementation_->predict(input); }
-    InferenceProvider EncryptedInference::provider() const { return implementation_->provider; }
-    bool EncryptedInference::cuda_available() { return fides::cuda_available(); }
+    CiphertextInference::~CiphertextInference() = default;
+    CiphertextInference::CiphertextInference(CiphertextInference &&) noexcept = default;
+    CiphertextInference &CiphertextInference::operator=(CiphertextInference &&) noexcept = default;
+    CiphertextInferenceResult CiphertextInference::predict(const std::vector<double> &input) { return implementation_->predict(input); }
+    ExecutionTarget CiphertextInference::target() const { return implementation_->target; }
+    bool CiphertextInference::cuda_available() { return cuda::cuda_available(); }
 }

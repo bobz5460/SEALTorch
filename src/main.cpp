@@ -93,14 +93,14 @@ static RunConfig parse_config(const json::Value &request) {
     config.threads = static_cast<std::size_t>(int_or(value, "threads", 4)); config.ring_dim = int_or(value, "ring_dim", 16384); config.depth = int_or(value, "depth", 15);
     config.scaling_mod_bits = int_or(value, "scaling_mod_bits", 40); config.first_mod_bits = int_or(value, "first_mod_bits", 50); config.scale_bits = int_or(value, "scale_bits", 25);
     if (config.threads == 0 || config.ring_dim < 1024 || (config.ring_dim & (config.ring_dim - 1)) || config.depth < 1 || config.scale_bits < 1) throw std::runtime_error("invalid inference configuration");
-    if (config.device != "auto" && config.device != "cpu" && config.device != "cuda") throw std::runtime_error("plaintext_device must be auto, cpu, or cuda");
+    if (config.device != "auto" && config.device != "cpu" && config.device != "cuda") throw std::runtime_error("ciphertext inference device must be auto, cpu, or cuda");
     return config;
 }
 
-static sealtorch::EncryptedInferenceOptions inference_options(const RunConfig &config) {
+static sealtorch::CiphertextInferenceOptions ciphertext_inference_options(const RunConfig &config) {
     return {
-        config.device == "cpu" ? sealtorch::InferenceProvider::CPU :
-        config.device == "cuda" ? sealtorch::InferenceProvider::CUDA : sealtorch::InferenceProvider::Auto,
+        config.device == "cpu" ? sealtorch::ExecutionTarget::CPU :
+        config.device == "cuda" ? sealtorch::ExecutionTarget::CUDA : sealtorch::ExecutionTarget::Auto,
         config.packed ? sealtorch::CiphertextLayout::Packed : sealtorch::CiphertextLayout::Scalar,
         config.threads, static_cast<std::size_t>(config.ring_dim), static_cast<std::size_t>(config.depth),
         static_cast<std::size_t>(config.scaling_mod_bits), static_cast<std::size_t>(config.first_mod_bits),
@@ -112,25 +112,25 @@ static void print_numbers(const std::vector<double> &values) { std::cout << '[';
 static const std::string &model_path(const json::Value &request) { static const std::string relu = "src/mnist_mlp.json", gelu = "src/mnist_mlp_gelu.json"; const std::string selected = request.has("model") ? request.at("model").string : "relu"; if (selected == "relu") return relu; if (selected == "gelu") return gelu; throw std::runtime_error("model must be relu or gelu"); }
 
 static int run_web_worker() {
-    std::unique_ptr<sealtorch::EncryptedInference> inference;
+    std::unique_ptr<sealtorch::CiphertextInference> ciphertext_inference;
     std::string active_model; RunConfig active_config; std::string line;
     while (std::getline(std::cin, line)) try {
         const auto request = json::Parser(line).parse(); const auto &pixels = request.at("pixels"); if (pixels.array.size() != 784) throw std::runtime_error("pixels must contain 784 values"); std::vector<double> input; for (const auto &item : pixels.array) input.push_back(item.number);
         const RunConfig config = parse_config(request); const std::string &selected_model = model_path(request);
-        const bool rebuild = !inference || config != active_config || selected_model != active_model;
+        const bool rebuild = !ciphertext_inference || config != active_config || selected_model != active_model;
         double setup_ms = 0.0;
         if (rebuild) {
             const auto setup_start = std::chrono::steady_clock::now();
             const ModelArtifact artifact = load_model(selected_model);
-            inference = std::make_unique<sealtorch::EncryptedInference>(artifact.encrypted, inference_options(config));
-            inference->predict(input);
+            ciphertext_inference = std::make_unique<sealtorch::CiphertextInference>(artifact.encrypted, ciphertext_inference_options(config));
+            ciphertext_inference->predict(input);
             active_config = config;
             active_model = selected_model;
             setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count();
         }
         const double memory_before = memory_mb();
-        const sealtorch::EncryptedInferenceResult encrypted = inference->predict(input);
-        const bool use_cuda = inference->provider() == sealtorch::InferenceProvider::CUDA;
+        const sealtorch::CiphertextInferenceResult encrypted = ciphertext_inference->predict(input);
+        const bool use_cuda = ciphertext_inference->target() == sealtorch::ExecutionTarget::CUDA;
         std::cout << "{\"encrypted\":"; print_numbers(encrypted.values); std::cout << ",\"setup_ms\":" << setup_ms << ",\"encrypt_ms\":" << encrypted.encrypt_ms << ",\"evaluate_ms\":" << encrypted.evaluate_ms << ",\"decrypt_ms\":" << encrypted.decrypt_ms << ",\"encrypted_ms\":" << encrypted.encrypt_ms + encrypted.evaluate_ms + encrypted.decrypt_ms << ",\"memory_before_mb\":" << memory_before << ",\"memory_after_mb\":" << memory_mb() << ",\"input_ciphertext_bytes\":" << encrypted.input_ciphertext_bytes << ",\"output_ciphertext_bytes\":" << encrypted.output_ciphertext_bytes << ",\"backend\":\"" << (config.packed ? "packed" : "scalar") << "\",\"device\":\"" << (use_cuda ? "cuda" : "cpu") << "\"}\n";
     } catch (const std::exception &error) { std::cout << "{\"error\":\"" << error.what() << "\"}\n"; }
     std::cout.flush();
