@@ -97,115 +97,41 @@ static RunConfig parse_config(const json::Value &request) {
     return config;
 }
 
-static std::size_t ciphertext_bytes(const seal::Ciphertext &value, const RunConfig &config) {
-    (void)value;
-    // SEAL exposes an opaque parms_id rather than a numeric level. This is a
-    // comparable coefficient-storage estimate, not a serialized wire size.
-    const std::size_t remaining_moduli = static_cast<std::size_t>(config.depth + 1);
-    return 2 * static_cast<std::size_t>(config.ring_dim) * remaining_moduli * sizeof(std::uint64_t);
+static sealtorch::EncryptedInferenceOptions inference_options(const RunConfig &config) {
+    return {
+        config.device == "cpu" ? sealtorch::InferenceProvider::CPU :
+        config.device == "cuda" ? sealtorch::InferenceProvider::CUDA : sealtorch::InferenceProvider::Auto,
+        config.packed ? sealtorch::CiphertextLayout::Packed : sealtorch::CiphertextLayout::Scalar,
+        config.threads, static_cast<std::size_t>(config.ring_dim), static_cast<std::size_t>(config.depth),
+        static_cast<std::size_t>(config.scaling_mod_bits), static_cast<std::size_t>(config.first_mod_bits),
+        static_cast<std::size_t>(config.scale_bits)};
 }
-
-struct CiphertextRun { std::vector<double> values; double encrypt_ms = 0.0; double evaluate_ms = 0.0; double decrypt_ms = 0.0; std::size_t input_bytes = 0; std::size_t output_bytes = 0; };
-
-class WebInference {
-public:
-    WebInference(ModelArtifact artifact, RunConfig config)
-        : artifact_(std::move(artifact)), config_(std::move(config)), context_(make_context(config_)), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(artifact_.encrypted), scale_(std::ldexp(1.0, config_.scale_bits)) {
-        if (config_.device == "cuda")
-            throw std::runtime_error("CUDA was requested, but this build uses the Microsoft SEAL CPU backend");
-        keys_.create_relin_keys(relin_keys_); std::vector<int32_t> rotations;
-        for (const auto &layer : model_.model().layers()) { for (int step = 1; step < layer.input_size; ++step) rotations.push_back(step); for (int step = 1; step < layer.output_size; ++step) rotations.push_back(-step); }
-        std::sort(rotations.begin(), rotations.end()); rotations.erase(std::unique(rotations.begin(), rotations.end()), rotations.end());
-        keys_.create_galois_keys(rotations, galois_keys_);
-    }
-    CiphertextRun predict(const std::vector<double> &input) {
-        CiphertextRun run; const auto encrypt_start = std::chrono::steady_clock::now(); seal::Plaintext plain; encoder_.encode(input, scale_, plain); seal::Ciphertext encrypted; encryptor_.encrypt_symmetric(plain, encrypted); run.input_bytes = ciphertext_bytes(encrypted, config_); const auto encrypt_end = std::chrono::steady_clock::now();
-        sealtorch::PredictionConfig prediction(context_, evaluator_, relin_keys_, galois_keys_, encoder_, scale_, config_.packed ? static_cast<const sealtorch::CiphertextBackend &>(packed_backend_) : static_cast<const sealtorch::CiphertextBackend &>(scalar_backend_), config_.threads);
-        const auto evaluate_start = std::chrono::steady_clock::now(); const auto output = model_.predict({encrypted}, prediction); const auto evaluate_end = std::chrono::steady_clock::now();
-        const auto decrypt_start = std::chrono::steady_clock::now(); seal::Decryptor decryptor(context_, keys_.secret_key());
-        if (config_.packed) { seal::Plaintext decoded; seal::Ciphertext value = output.front(); decryptor.decrypt(value, decoded); encoder_.decode(decoded, run.values); run.output_bytes = ciphertext_bytes(value, config_); }
-        else for (const auto &source : output) { seal::Plaintext decoded; std::vector<double> values; seal::Ciphertext value = source; decryptor.decrypt(value, decoded); encoder_.decode(decoded, values); run.values.push_back(values.front()); run.output_bytes += ciphertext_bytes(value, config_); }
-        run.values.resize(static_cast<std::size_t>(model_.model().output_size())); const auto decrypt_end = std::chrono::steady_clock::now();
-        run.encrypt_ms = std::chrono::duration<double, std::milli>(encrypt_end - encrypt_start).count(); run.evaluate_ms = std::chrono::duration<double, std::milli>(evaluate_end - evaluate_start).count(); run.decrypt_ms = std::chrono::duration<double, std::milli>(decrypt_end - decrypt_start).count(); return run;
-    }
-    const RunConfig &config() const { return config_; }
-private:
-    static seal::SEALContext make_context(const RunConfig &config) {
-        seal::EncryptionParameters parameters(seal::scheme_type::ckks);
-        parameters.set_poly_modulus_degree(static_cast<std::size_t>(config.ring_dim));
-        // CPU SEAL uses a modulus chain matched to the configured CKKS scale.
-        std::vector<int> modulus_bits(static_cast<std::size_t>(config.depth), config.scale_bits);
-        modulus_bits.insert(modulus_bits.begin(), config.first_mod_bits);
-        parameters.set_coeff_modulus(seal::CoeffModulus::Create(config.ring_dim, modulus_bits));
-        seal::SEALContext context(parameters, true, seal::sec_level_type::none);
-        if (!context.parameters_set())
-            throw std::runtime_error("invalid CKKS parameters for the Microsoft SEAL CPU backend");
-        return context;
-    }
-    ModelArtifact artifact_; RunConfig config_; seal::SEALContext context_; seal::KeyGenerator keys_; seal::RelinKeys relin_keys_; seal::GaloisKeys galois_keys_; seal::Encryptor encryptor_; seal::Evaluator evaluator_; seal::CKKSEncoder encoder_; sealtorch::ScalarBackend scalar_backend_; sealtorch::PackedBackend packed_backend_; sealtorch::CiphertextModel model_; double scale_;
-};
-
-// The worker uses the same small result type for either native provider. The
-// FIDESlib engine itself stays in SEALTorch; this adapter only times a call.
-class FidesWebInference {
-public:
-    FidesWebInference(const ModelArtifact &artifact, const RunConfig &config)
-        : engine_(artifact.encrypted, sealtorch::fides::Options{
-              static_cast<std::size_t>(config.ring_dim),
-              static_cast<std::size_t>(config.depth),
-              static_cast<std::size_t>(config.scaling_mod_bits),
-              static_cast<std::size_t>(config.first_mod_bits)})
-    {
-        if (!config.packed)
-            throw std::runtime_error("FIDESlib CUDA inference currently supports packed layout; select CPU for the scalar benchmark");
-    }
-
-    CiphertextRun predict(const std::vector<double> &input)
-    {
-        const auto started = std::chrono::steady_clock::now();
-        CiphertextRun run;
-        run.values = engine_.predict(input);
-        run.evaluate_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - started).count();
-        return run;
-    }
-
-private:
-    sealtorch::fides::InferenceEngine engine_;
-};
 
 static double memory_mb() { std::ifstream file("/proc/self/status"); std::string line; while (std::getline(file, line)) if (line.rfind("VmRSS:", 0) == 0) { std::istringstream values(line.substr(6)); double kilobytes = 0; values >> kilobytes; return kilobytes / 1024.0; } return 0; }
 static void print_numbers(const std::vector<double> &values) { std::cout << '['; for (std::size_t i = 0; i < values.size(); ++i) { if (i) std::cout << ','; std::cout << std::setprecision(12) << values[i]; } std::cout << ']'; }
 static const std::string &model_path(const json::Value &request) { static const std::string relu = "src/mnist_mlp.json", gelu = "src/mnist_mlp_gelu.json"; const std::string selected = request.has("model") ? request.at("model").string : "relu"; if (selected == "relu") return relu; if (selected == "gelu") return gelu; throw std::runtime_error("model must be relu or gelu"); }
 
 static int run_web_worker() {
-    std::unique_ptr<WebInference> cpu_inference;
-    std::unique_ptr<FidesWebInference> cuda_inference;
-    std::string active_model; RunConfig active_config; bool active_cuda = false; std::string line;
+    std::unique_ptr<sealtorch::EncryptedInference> inference;
+    std::string active_model; RunConfig active_config; std::string line;
     while (std::getline(std::cin, line)) try {
         const auto request = json::Parser(line).parse(); const auto &pixels = request.at("pixels"); if (pixels.array.size() != 784) throw std::runtime_error("pixels must contain 784 values"); std::vector<double> input; for (const auto &item : pixels.array) input.push_back(item.number);
         const RunConfig config = parse_config(request); const std::string &selected_model = model_path(request);
-        const bool use_cuda = config.device == "cuda" || (config.device == "auto" && sealtorch::fides::cuda_available());
-        const bool rebuild = (use_cuda ? !cuda_inference : !cpu_inference) || use_cuda != active_cuda || config != active_config || selected_model != active_model;
+        const bool rebuild = !inference || config != active_config || selected_model != active_model;
         double setup_ms = 0.0;
         if (rebuild) {
             const auto setup_start = std::chrono::steady_clock::now();
             const ModelArtifact artifact = load_model(selected_model);
-            if (use_cuda) {
-                cuda_inference = std::make_unique<FidesWebInference>(artifact, config);
-                cuda_inference->predict(input);
-            } else {
-                cpu_inference = std::make_unique<WebInference>(artifact, config);
-                cpu_inference->predict(input);
-            }
+            inference = std::make_unique<sealtorch::EncryptedInference>(artifact.encrypted, inference_options(config));
+            inference->predict(input);
             active_config = config;
             active_model = selected_model;
-            active_cuda = use_cuda;
             setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count();
         }
         const double memory_before = memory_mb();
-        const CiphertextRun encrypted = use_cuda ? cuda_inference->predict(input) : cpu_inference->predict(input);
-        std::cout << "{\"encrypted\":"; print_numbers(encrypted.values); std::cout << ",\"setup_ms\":" << setup_ms << ",\"encrypt_ms\":" << encrypted.encrypt_ms << ",\"evaluate_ms\":" << encrypted.evaluate_ms << ",\"decrypt_ms\":" << encrypted.decrypt_ms << ",\"encrypted_ms\":" << encrypted.encrypt_ms + encrypted.evaluate_ms + encrypted.decrypt_ms << ",\"memory_before_mb\":" << memory_before << ",\"memory_after_mb\":" << memory_mb() << ",\"input_ciphertext_bytes\":" << encrypted.input_bytes << ",\"output_ciphertext_bytes\":" << encrypted.output_bytes << ",\"backend\":\"" << (config.packed ? "packed" : "scalar") << "\",\"device\":\"" << (use_cuda ? "cuda" : "cpu") << "\"}\n";
+        const sealtorch::EncryptedInferenceResult encrypted = inference->predict(input);
+        const bool use_cuda = inference->provider() == sealtorch::InferenceProvider::CUDA;
+        std::cout << "{\"encrypted\":"; print_numbers(encrypted.values); std::cout << ",\"setup_ms\":" << setup_ms << ",\"encrypt_ms\":" << encrypted.encrypt_ms << ",\"evaluate_ms\":" << encrypted.evaluate_ms << ",\"decrypt_ms\":" << encrypted.decrypt_ms << ",\"encrypted_ms\":" << encrypted.encrypt_ms + encrypted.evaluate_ms + encrypted.decrypt_ms << ",\"memory_before_mb\":" << memory_before << ",\"memory_after_mb\":" << memory_mb() << ",\"input_ciphertext_bytes\":" << encrypted.input_ciphertext_bytes << ",\"output_ciphertext_bytes\":" << encrypted.output_ciphertext_bytes << ",\"backend\":\"" << (config.packed ? "packed" : "scalar") << "\",\"device\":\"" << (use_cuda ? "cuda" : "cpu") << "\"}\n";
     } catch (const std::exception &error) { std::cout << "{\"error\":\"" << error.what() << "\"}\n"; }
     std::cout.flush();
     return 0;

@@ -17,6 +17,7 @@ add_library(SEALTorch STATIC
     src/SEALTorch/evaluator.cpp
     src/SEALTorch/metrics.cpp
     src/SEALTorch/inference.cpp
+    src/SEALTorch/encrypted_inference.cpp
     src/SEALTorch/fides_inference.cpp)
 add_library(SEALTorch::SEALTorch ALIAS SEALTorch)
 
