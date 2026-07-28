@@ -22,10 +22,7 @@ except ModuleNotFoundError:
     raise
 
 BUILD_DIR = pathlib.Path(os.environ.get("SEALTORCH_BUILD_DIR", ROOT / "build"))
-HE_BINARIES = {
-    "cpu": pathlib.Path(os.environ.get("SEALTORCH_CPU_BINARY", BUILD_DIR / "sealtorch_gui_cpu")),
-    "cuda": pathlib.Path(os.environ.get("SEALTORCH_CUDA_BINARY", BUILD_DIR / "sealtorch_gui_cuda")),
-}
+HE_BINARY = pathlib.Path(os.environ.get("SEALTORCH_HE_BINARY", BUILD_DIR / "sealtorch_gui"))
 RESULTS_DIR = ROOT / "results"
 MNIST_DIR = ROOT / "data" / "MNIST" / "raw"
 plaintext_models = {}
@@ -129,27 +126,16 @@ class HEWorker:
                     return response
 
 
-he_workers = {"cpu": HEWorker(), "cuda": HEWorker()}
+he_worker = HEWorker()
 
 
 def select_he_backend(requested_device):
-    """Map an experiment's device setting to a binary compiled for that HE provider."""
+    """Validate a provider choice handled by the single SEALTorch worker."""
     if requested_device not in ("auto", "cpu", "cuda"):
         raise ValueError("device must be auto, cpu, or cuda")
-    if requested_device == "cpu":
-        backend = "cpu"
-    elif requested_device == "cuda":
-        backend = "cuda"
-    else:
-        # Preserve the usual auto-device preference while allowing CPU-only
-        # benchmark builds to run without a CUDA/FIDESlib installation.
-        backend = "cuda" if HE_BINARIES["cuda"].exists() else "cpu"
-    binary = HE_BINARIES[backend]
-    if not binary.exists():
-        raise RuntimeError(
-            f"HE {backend.upper()} backend is not built ({binary}). "
-            "Reconfigure with the matching SEALTORCH_BUILD_*_BACKEND option.")
-    return backend, binary
+    if not HE_BINARY.exists():
+        raise RuntimeError(f"SEALTorch worker is not built ({HE_BINARY}). Run cmake --build build.")
+    return HE_BINARY
 
 
 def gpu_power_watts():
@@ -218,13 +204,12 @@ def execute(request):
             "output_ciphertext_bytes": 0, "setup_ms": setup_ms,
         }
     else:
-        backend, binary = select_he_backend(config.get("device", "auto"))
-        result = he_workers[backend].run(request, binary)
+        binary = select_he_backend(config.get("device", "auto"))
+        result = he_worker.run(request, binary)
         if "error" not in result:
             result["engine"] = "he"
-            # The server chooses a provider-specific binary, so this field
-            # reflects execution rather than merely echoing the request.
-            result["device"] = backend
+            # The native worker reports whether this request used SEAL CPU or
+            # FIDESlib CUDA. Keep that observed value rather than echoing it.
             result["output"] = result["encrypted"]
             result["execution_ms"] = result["encrypted_ms"]
             result["setup_ms"] = result.get("setup_ms", 0) + result.get("worker_startup_ms", 0)
@@ -351,8 +336,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/health":
-            self.send_json({"ok": any(binary.exists() for binary in HE_BINARIES.values()),
-                            "he_backends": {name: binary.exists() for name, binary in HE_BINARIES.items()}})
+            self.send_json({"ok": HE_BINARY.exists(),
+                            "he_backends": {"cpu": HE_BINARY.exists(), "cuda": HE_BINARY.exists()}})
             return
         if self.path == "/api/mnist/data":
             self.send_json(mnist_data_status())
@@ -409,7 +394,7 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-if not any(binary.exists() for binary in HE_BINARIES.values()):
+if not HE_BINARY.exists():
     print("Build SEALTorch first: cmake -S . -B build && cmake --build build -j2", file=sys.stderr)
     sys.exit(1)
 

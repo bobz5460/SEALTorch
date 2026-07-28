@@ -89,7 +89,7 @@ static int int_or(const json::Value &object, const std::string &name, int fallba
 }
 static RunConfig parse_config(const json::Value &request) {
     const json::Value &value = request.has("config") ? request.at("config") : request;
-    RunConfig config; config.packed = string_or(value, "backend", "packed") != "scalar"; config.device = string_or(value, "plaintext_device", "auto");
+    RunConfig config; config.packed = string_or(value, "backend", "packed") != "scalar"; config.device = string_or(value, "device", string_or(value, "plaintext_device", "auto"));
     config.threads = static_cast<std::size_t>(int_or(value, "threads", 4)); config.ring_dim = int_or(value, "ring_dim", 16384); config.depth = int_or(value, "depth", 15);
     config.scaling_mod_bits = int_or(value, "scaling_mod_bits", 40); config.first_mod_bits = int_or(value, "first_mod_bits", 50); config.scale_bits = int_or(value, "scale_bits", 25);
     if (config.threads == 0 || config.ring_dim < 1024 || (config.ring_dim & (config.ring_dim - 1)) || config.depth < 1 || config.scale_bits < 1) throw std::runtime_error("invalid inference configuration");
@@ -145,27 +145,67 @@ private:
     ModelArtifact artifact_; RunConfig config_; seal::SEALContext context_; seal::KeyGenerator keys_; seal::RelinKeys relin_keys_; seal::GaloisKeys galois_keys_; seal::Encryptor encryptor_; seal::Evaluator evaluator_; seal::CKKSEncoder encoder_; sealtorch::ScalarBackend scalar_backend_; sealtorch::PackedBackend packed_backend_; sealtorch::CiphertextModel model_; double scale_;
 };
 
+// The worker uses the same small result type for either native provider. The
+// FIDESlib engine itself stays in SEALTorch; this adapter only times a call.
+class FidesWebInference {
+public:
+    FidesWebInference(const ModelArtifact &artifact, const RunConfig &config)
+        : engine_(artifact.encrypted, sealtorch::fides::Options{
+              static_cast<std::size_t>(config.ring_dim),
+              static_cast<std::size_t>(config.depth),
+              static_cast<std::size_t>(config.scaling_mod_bits),
+              static_cast<std::size_t>(config.first_mod_bits)})
+    {
+        if (!config.packed)
+            throw std::runtime_error("FIDESlib CUDA inference currently supports packed layout; select CPU for the scalar benchmark");
+    }
+
+    CiphertextRun predict(const std::vector<double> &input)
+    {
+        const auto started = std::chrono::steady_clock::now();
+        CiphertextRun run;
+        run.values = engine_.predict(input);
+        run.evaluate_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+        return run;
+    }
+
+private:
+    sealtorch::fides::InferenceEngine engine_;
+};
+
 static double memory_mb() { std::ifstream file("/proc/self/status"); std::string line; while (std::getline(file, line)) if (line.rfind("VmRSS:", 0) == 0) { std::istringstream values(line.substr(6)); double kilobytes = 0; values >> kilobytes; return kilobytes / 1024.0; } return 0; }
 static void print_numbers(const std::vector<double> &values) { std::cout << '['; for (std::size_t i = 0; i < values.size(); ++i) { if (i) std::cout << ','; std::cout << std::setprecision(12) << values[i]; } std::cout << ']'; }
 static const std::string &model_path(const json::Value &request) { static const std::string relu = "src/mnist_mlp.json", gelu = "src/mnist_mlp_gelu.json"; const std::string selected = request.has("model") ? request.at("model").string : "relu"; if (selected == "relu") return relu; if (selected == "gelu") return gelu; throw std::runtime_error("model must be relu or gelu"); }
 
 static int run_web_worker() {
-    std::unique_ptr<WebInference> inference; std::string active_model; RunConfig active_config; std::string line;
+    std::unique_ptr<WebInference> cpu_inference;
+    std::unique_ptr<FidesWebInference> cuda_inference;
+    std::string active_model; RunConfig active_config; bool active_cuda = false; std::string line;
     while (std::getline(std::cin, line)) try {
         const auto request = json::Parser(line).parse(); const auto &pixels = request.at("pixels"); if (pixels.array.size() != 784) throw std::runtime_error("pixels must contain 784 values"); std::vector<double> input; for (const auto &item : pixels.array) input.push_back(item.number);
-        const RunConfig config = parse_config(request); const std::string &selected_model = model_path(request); const bool rebuild = !inference || config != active_config || selected_model != active_model;
+        const RunConfig config = parse_config(request); const std::string &selected_model = model_path(request);
+        const bool use_cuda = config.device == "cuda" || (config.device == "auto" && sealtorch::fides::cuda_available());
+        const bool rebuild = (use_cuda ? !cuda_inference : !cpu_inference) || use_cuda != active_cuda || config != active_config || selected_model != active_model;
         double setup_ms = 0.0;
         if (rebuild) {
             const auto setup_start = std::chrono::steady_clock::now();
-            inference = std::make_unique<WebInference>(load_model(selected_model), config);
-            // Build caches before measuring a benchmark sample.
-            inference->predict(input);
+            const ModelArtifact artifact = load_model(selected_model);
+            if (use_cuda) {
+                cuda_inference = std::make_unique<FidesWebInference>(artifact, config);
+                cuda_inference->predict(input);
+            } else {
+                cpu_inference = std::make_unique<WebInference>(artifact, config);
+                cpu_inference->predict(input);
+            }
             active_config = config;
             active_model = selected_model;
+            active_cuda = use_cuda;
             setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count();
         }
-        const double memory_before = memory_mb(); const auto encrypted = inference->predict(input);
-        std::cout << "{\"encrypted\":"; print_numbers(encrypted.values); std::cout << ",\"setup_ms\":" << setup_ms << ",\"encrypt_ms\":" << encrypted.encrypt_ms << ",\"evaluate_ms\":" << encrypted.evaluate_ms << ",\"decrypt_ms\":" << encrypted.decrypt_ms << ",\"encrypted_ms\":" << encrypted.encrypt_ms + encrypted.evaluate_ms + encrypted.decrypt_ms << ",\"memory_before_mb\":" << memory_before << ",\"memory_after_mb\":" << memory_mb() << ",\"input_ciphertext_bytes\":" << encrypted.input_bytes << ",\"output_ciphertext_bytes\":" << encrypted.output_bytes << ",\"backend\":\"" << (config.packed ? "packed" : "scalar") << "\",\"device\":\"" << (inference->config().device == "cuda" ? "cuda" : "cpu") << "\"}\n";
+        const double memory_before = memory_mb();
+        const CiphertextRun encrypted = use_cuda ? cuda_inference->predict(input) : cpu_inference->predict(input);
+        std::cout << "{\"encrypted\":"; print_numbers(encrypted.values); std::cout << ",\"setup_ms\":" << setup_ms << ",\"encrypt_ms\":" << encrypted.encrypt_ms << ",\"evaluate_ms\":" << encrypted.evaluate_ms << ",\"decrypt_ms\":" << encrypted.decrypt_ms << ",\"encrypted_ms\":" << encrypted.encrypt_ms + encrypted.evaluate_ms + encrypted.decrypt_ms << ",\"memory_before_mb\":" << memory_before << ",\"memory_after_mb\":" << memory_mb() << ",\"input_ciphertext_bytes\":" << encrypted.input_bytes << ",\"output_ciphertext_bytes\":" << encrypted.output_bytes << ",\"backend\":\"" << (config.packed ? "packed" : "scalar") << "\",\"device\":\"" << (use_cuda ? "cuda" : "cpu") << "\"}\n";
     } catch (const std::exception &error) { std::cout << "{\"error\":\"" << error.what() << "\"}\n"; }
     std::cout.flush();
     return 0;
