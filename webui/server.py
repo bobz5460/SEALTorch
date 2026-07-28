@@ -21,7 +21,11 @@ except ModuleNotFoundError:
         os.execv(str(venv_python), [str(venv_python), __file__, *sys.argv[1:]])
     raise
 
-BUILD = pathlib.Path(os.environ.get("SEALTORCH_BINARY", ROOT / "build" / "sealtorch_gui"))
+BUILD_DIR = pathlib.Path(os.environ.get("SEALTORCH_BUILD_DIR", ROOT / "build"))
+HE_BINARIES = {
+    "cpu": pathlib.Path(os.environ.get("SEALTORCH_CPU_BINARY", BUILD_DIR / "sealtorch_gui_cpu")),
+    "cuda": pathlib.Path(os.environ.get("SEALTORCH_CUDA_BINARY", BUILD_DIR / "sealtorch_gui_cuda")),
+}
 RESULTS_DIR = ROOT / "results"
 MNIST_DIR = ROOT / "data" / "MNIST" / "raw"
 plaintext_models = {}
@@ -84,7 +88,7 @@ def run_plaintext(pixels, name, requested_device):
 
 
 class HEWorker:
-    """One warm CUDA context per HE configuration; replaces it on a change."""
+    """One warm HE context per configuration; replaces it on a change."""
     def __init__(self):
         self.process = None
         self.config_key = None
@@ -97,16 +101,16 @@ class HEWorker:
             except subprocess.TimeoutExpired: self.process.kill()
         self.process = self.config_key = None
 
-    def run(self, request):
+    def run(self, request, binary):
         config_key = json.dumps({"model": request.get("model"), "config": request.get("config")}, sort_keys=True)
         with self.lock:
             worker_startup_ms = 0
-            if self.process is None or self.process.poll() is not None or self.config_key != config_key:
+            if self.process is None or self.process.poll() is not None or self.config_key != (binary, config_key):
                 worker_startup_started = time.perf_counter()
                 self.close()
-                self.process = subprocess.Popen([str(BUILD), "--web-worker"], cwd=ROOT,
+                self.process = subprocess.Popen([str(binary), "--web-worker"], cwd=ROOT,
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-                self.config_key = config_key
+                self.config_key = (binary, config_key)
                 worker_startup_ms = (time.perf_counter() - worker_startup_started) * 1000
             self.process.stdin.write(json.dumps(request) + "\n")
             self.process.stdin.flush()
@@ -125,7 +129,27 @@ class HEWorker:
                     return response
 
 
-he_worker = HEWorker()
+he_workers = {"cpu": HEWorker(), "cuda": HEWorker()}
+
+
+def select_he_backend(requested_device):
+    """Map an experiment's device setting to a binary compiled for that HE provider."""
+    if requested_device not in ("auto", "cpu", "cuda"):
+        raise ValueError("device must be auto, cpu, or cuda")
+    if requested_device == "cpu":
+        backend = "cpu"
+    elif requested_device == "cuda":
+        backend = "cuda"
+    else:
+        # Preserve the usual auto-device preference while allowing CPU-only
+        # benchmark builds to run without a CUDA/FIDESlib installation.
+        backend = "cuda" if HE_BINARIES["cuda"].exists() else "cpu"
+    binary = HE_BINARIES[backend]
+    if not binary.exists():
+        raise RuntimeError(
+            f"HE {backend.upper()} backend is not built ({binary}). "
+            "Reconfigure with the matching SEALTORCH_BUILD_*_BACKEND option.")
+    return backend, binary
 
 
 def gpu_power_watts():
@@ -194,12 +218,13 @@ def execute(request):
             "output_ciphertext_bytes": 0, "setup_ms": setup_ms,
         }
     else:
-        if config.get("device", "auto") == "cpu":
-            raise RuntimeError("HE CPU is unavailable: this FIDESlib build requires CUDA for ciphertext inference")
-        result = he_worker.run(request)
+        backend, binary = select_he_backend(config.get("device", "auto"))
+        result = he_workers[backend].run(request, binary)
         if "error" not in result:
             result["engine"] = "he"
-            result["device"] = "cuda"
+            # The server chooses a provider-specific binary, so this field
+            # reflects execution rather than merely echoing the request.
+            result["device"] = backend
             result["output"] = result["encrypted"]
             result["execution_ms"] = result["encrypted_ms"]
             result["setup_ms"] = result.get("setup_ms", 0) + result.get("worker_startup_ms", 0)
@@ -326,7 +351,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/health":
-            self.send_json({"ok": BUILD.exists()})
+            self.send_json({"ok": any(binary.exists() for binary in HE_BINARIES.values()),
+                            "he_backends": {name: binary.exists() for name, binary in HE_BINARIES.items()}})
             return
         if self.path == "/api/mnist/data":
             self.send_json(mnist_data_status())
@@ -383,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-if not BUILD.exists():
+if not any(binary.exists() for binary in HE_BINARIES.values()):
     print("Build SEALTorch first: cmake -S . -B build && cmake --build build -j2", file=sys.stderr)
     sys.exit(1)
 

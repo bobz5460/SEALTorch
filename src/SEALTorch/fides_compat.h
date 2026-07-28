@@ -1,8 +1,10 @@
 #pragma once
 
-// Small SEAL-shaped facade over FIDESlib.  It keeps the model evaluator
-// independent of a particular FHE provider while routing every operation to
-// FIDESlib/OpenFHE (and therefore its CUDA backend).
+// The evaluator uses native Microsoft SEAL for CPU builds. This facade only
+// adapts FIDESlib's CUDA API to the same surface.
+#if !SEALTORCH_USE_FIDESLIB
+#include <seal/seal.h>
+#else
 #include <fideslib.hpp>
 
 #include <cstddef>
@@ -109,3 +111,4 @@ private:
     fideslib::PrivateKey<fideslib::DCRTPoly> key_;
 };
 } // namespace seal
+#endif
