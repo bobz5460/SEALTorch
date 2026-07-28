@@ -32,6 +32,14 @@ namespace sealtorch
         ThreadPool &thread_pool,
         const std::vector<seal::Plaintext> *cached_weights);
 
+    // Degree-four polynomial approximation of ReLU, range-normalized for
+    // the exported MNIST MLP's approximately [-10, 10] activations.
+    //
+    //   ReLU(x) ~= 0.33810450 + 0.5*x + 0.096514968*x^2
+    //              - 0.00053277056*x^4
+    //
+    // The ciphertext must have at least three rescaling levels available,
+    // and the caller's scale should match the scale used to encrypt input.
     seal::Ciphertext approximate_relu(
         const seal::Evaluator& evaluator,
         const seal::RelinKeys& relin_keys,

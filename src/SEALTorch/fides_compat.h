@@ -49,7 +49,11 @@ public:
         (void)scale;
     }
     void encode(double value, double scale, Plaintext &output, MemoryPoolHandle = {}) const {
-        encode(std::vector<double>{value}, scale, output);
+        // SEAL's scalar CKKS encoder replicates the value in every slot.  A
+        // one-element OpenFHE packed plaintext only populates slot zero,
+        // which silently made packed polynomial activations affect just the
+        // first neuron in each layer.
+        encode(std::vector<double>(slot_count(), value), scale, output);
     }
     void decode(const Plaintext &input, std::vector<double> &output) const { output = input.value->GetRealPackedValue(); }
 private:

@@ -213,9 +213,14 @@ namespace sealtorch
         const seal::Ciphertext& input,
         double scale)
     {
+        // The base fit is defined on [-2, 2], while the exported MNIST MLP
+        // has activations up to about 10.  Apply P(x / 5) * 5 so the same
+        // degree and multiplicative depth cover [-10, 10].  Evaluating the
+        // unscaled polynomial at those values makes its negative quartic
+        // term dominate and collapses ciphertext predictions.
         return approximate_polynomial(
             evaluator, relin_keys, encoder, input, scale,
-            0.06762090, 0.5, 0.48257484, -0.06659632);
+            0.33810450, 0.5, 0.096514968, -0.00053277056);
     }
 
     seal::Ciphertext approximate_gelu(
