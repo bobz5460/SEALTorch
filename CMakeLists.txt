@@ -21,11 +21,9 @@ target_include_directories(SEALTorch
         $<INSTALL_INTERFACE:include>)
 target_link_libraries(SEALTorch PUBLIC fideslib::fideslib OpenMP::OpenMP_CXX)
 
-find_package(X11 REQUIRED)
-
 add_executable(sealtorch_gui src/main.cpp)
 target_compile_features(sealtorch_gui PRIVATE cxx_std_20)
-target_link_libraries(sealtorch_gui PRIVATE SEALTorch::SEALTorch X11::X11)
+target_link_libraries(sealtorch_gui PRIVATE SEALTorch::SEALTorch)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/trace_main.cpp")
     add_executable(sealtorch_trace src/trace_main.cpp)
