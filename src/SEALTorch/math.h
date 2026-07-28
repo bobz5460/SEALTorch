@@ -1,6 +1,6 @@
 #pragma once
 
-#include <SEALTorch/fides_compat.h>
+#include <seal/seal.h>
 
 #include <cstddef>
 #include <vector>

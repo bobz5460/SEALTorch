@@ -2,8 +2,10 @@ cmake_minimum_required(VERSION 3.22)
 
 project(SEALTorch VERSION 0.1.0 LANGUAGES CXX)
 
-# Build each provider as an isolated target. Both binaries can coexist, which
-# lets the web worker choose CPU SEAL or CUDA FIDESlib for every experiment.
+# Build each provider as an isolated target.  The CPU worker uses Microsoft
+# SEAL directly; the CUDA worker uses FIDESlib directly.  Keeping the two
+# implementations separate is intentional: neither provider is disguised as
+# the other provider's API.
 option(SEALTORCH_BUILD_SEAL_BACKEND "Build the Microsoft SEAL CPU worker" ON)
 option(SEALTORCH_BUILD_FIDESLIB_BACKEND "Build the FIDESlib CUDA worker" ON)
 set(SEAL_DIR "$ENV{HOME}/.local/lib/cmake/SEAL-4.4" CACHE PATH
@@ -30,38 +32,33 @@ set(SEALTORCH_SOURCES
     src/SEALTorch/metrics.cpp
     src/SEALTorch/inference.cpp)
 
-function(add_he_worker suffix uses_fideslib)
-    add_library(SEALTorch_${suffix} STATIC ${SEALTORCH_SOURCES})
-    target_compile_features(SEALTorch_${suffix} PUBLIC cxx_std_20)
-    target_include_directories(SEALTorch_${suffix}
+function(add_seal_worker)
+    add_library(SEALTorch_cpu STATIC ${SEALTORCH_SOURCES})
+    target_compile_features(SEALTorch_cpu PUBLIC cxx_std_20)
+    target_include_directories(SEALTorch_cpu
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
             $<INSTALL_INTERFACE:include>)
-    target_compile_definitions(SEALTorch_${suffix} PUBLIC SEALTORCH_USE_FIDESLIB=${uses_fideslib})
-    if(uses_fideslib)
-        target_link_libraries(SEALTorch_${suffix} PUBLIC fideslib::fideslib)
-    else()
-        target_link_libraries(SEALTorch_${suffix} PUBLIC SEAL::seal)
-    endif()
-    # Static FIDESlib uses OpenMP, so keep the runtime after its archive.
-    target_link_libraries(SEALTorch_${suffix} PUBLIC OpenMP::OpenMP_CXX)
+    target_link_libraries(SEALTorch_cpu PUBLIC SEAL::seal OpenMP::OpenMP_CXX)
 
-    add_executable(sealtorch_gui_${suffix} src/main.cpp)
-    target_compile_features(sealtorch_gui_${suffix} PRIVATE cxx_std_20)
-    target_link_libraries(sealtorch_gui_${suffix} PRIVATE SEALTorch_${suffix})
+    add_executable(sealtorch_gui_cpu src/main.cpp)
+    target_compile_features(sealtorch_gui_cpu PRIVATE cxx_std_20)
+    target_link_libraries(sealtorch_gui_cpu PRIVATE SEALTorch_cpu)
 endfunction()
 
 if(SEALTORCH_BUILD_SEAL_BACKEND)
-    add_he_worker(cpu 0)
+    add_seal_worker()
 endif()
 if(SEALTORCH_BUILD_FIDESLIB_BACKEND)
-    add_he_worker(cuda 1)
+    # This executable deliberately does not link SEALTorch_cpu.  Its source
+    # names and uses FIDESlib types and operations directly.
+    add_executable(sealtorch_gui_cuda src/fides_main.cpp)
+    target_compile_features(sealtorch_gui_cuda PRIVATE cxx_std_20)
+    target_include_directories(sealtorch_gui_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(sealtorch_gui_cuda PRIVATE fideslib::fideslib OpenMP::OpenMP_CXX)
 endif()
 
-# Keep a conventional library alias for consumers that build exactly one
-# provider. A dual-provider build intentionally uses the suffixed targets.
+# Keep a conventional library alias for the native SEAL library.
 if(SEALTORCH_BUILD_SEAL_BACKEND AND NOT SEALTORCH_BUILD_FIDESLIB_BACKEND)
     add_library(SEALTorch::SEALTorch ALIAS SEALTorch_cpu)
-elseif(SEALTORCH_BUILD_FIDESLIB_BACKEND AND NOT SEALTORCH_BUILD_SEAL_BACKEND)
-    add_library(SEALTorch::SEALTorch ALIAS SEALTorch_cuda)
 endif()

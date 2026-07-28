@@ -1,9 +1,5 @@
 #include <SEALTorch/sealtorch.h>
 
-#if SEALTORCH_USE_FIDESLIB
-#include <cuda_runtime_api.h>
-#endif
-
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -101,17 +97,11 @@ static RunConfig parse_config(const json::Value &request) {
     return config;
 }
 
-// FIDESlib keeps ciphertext payloads opaque.  This is a coefficient-storage
-// estimate (not serialized wire size) so parameter sweeps remain comparable.
 static std::size_t ciphertext_bytes(const seal::Ciphertext &value, const RunConfig &config) {
-#if SEALTORCH_USE_FIDESLIB
-    const std::size_t remaining_moduli = std::max(1, config.depth + 2 - static_cast<int>(value.parms_id()));
-#else
     (void)value;
     // SEAL exposes an opaque parms_id rather than a numeric level. This is a
     // comparable coefficient-storage estimate, not a serialized wire size.
     const std::size_t remaining_moduli = static_cast<std::size_t>(config.depth + 1);
-#endif
     return 2 * static_cast<std::size_t>(config.ring_dim) * remaining_moduli * sizeof(std::uint64_t);
 }
 
@@ -120,26 +110,13 @@ struct CiphertextRun { std::vector<double> values; double encrypt_ms = 0.0; doub
 class WebInference {
 public:
     WebInference(ModelArtifact artifact, RunConfig config)
-        : artifact_(std::move(artifact)), config_(std::move(config)), gpu_enabled_(config_.device != "cpu" && has_cuda_device()), context_(make_context(config_, gpu_enabled_)), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(artifact_.encrypted), scale_(std::ldexp(1.0, config_.scale_bits)) {
-#if !SEALTORCH_USE_FIDESLIB
+        : artifact_(std::move(artifact)), config_(std::move(config)), context_(make_context(config_)), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(artifact_.encrypted), scale_(std::ldexp(1.0, config_.scale_bits)) {
         if (config_.device == "cuda")
             throw std::runtime_error("CUDA was requested, but this build uses the Microsoft SEAL CPU backend");
-#endif
-#if SEALTORCH_USE_FIDESLIB
-        if (!gpu_enabled_)
-            throw std::runtime_error("ciphertext inference requires a CUDA device: this build uses FIDESlib");
-#endif
         keys_.create_relin_keys(relin_keys_); std::vector<int32_t> rotations;
         for (const auto &layer : model_.model().layers()) { for (int step = 1; step < layer.input_size; ++step) rotations.push_back(step); for (int step = 1; step < layer.output_size; ++step) rotations.push_back(-step); }
         std::sort(rotations.begin(), rotations.end()); rotations.erase(std::unique(rotations.begin(), rotations.end()), rotations.end());
-#if SEALTORCH_USE_FIDESLIB
-        keys_.create_galois_keys(galois_keys_, rotations);
-#else
         keys_.create_galois_keys(rotations, galois_keys_);
-#endif
-#if SEALTORCH_USE_FIDESLIB
-        if (gpu_enabled_) keys_.load_context();
-#endif
     }
     CiphertextRun predict(const std::vector<double> &input) {
         CiphertextRun run; const auto encrypt_start = std::chrono::steady_clock::now(); seal::Plaintext plain; encoder_.encode(input, scale_, plain); seal::Ciphertext encrypted; encryptor_.encrypt_symmetric(plain, encrypted); run.input_bytes = ciphertext_bytes(encrypted, config_); const auto encrypt_end = std::chrono::steady_clock::now();
@@ -153,20 +130,7 @@ public:
     }
     const RunConfig &config() const { return config_; }
 private:
-    static bool has_cuda_device() {
-#if SEALTORCH_USE_FIDESLIB
-        int count = 0;
-        return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
-#else
-        return false;
-#endif
-    }
-    static seal::SEALContext make_context(const RunConfig &config, bool gpu_enabled) {
-#if SEALTORCH_USE_FIDESLIB
-        fideslib::CCParams<fideslib::CryptoContextCKKSRNS> parameters; parameters.SetRingDim(config.ring_dim); parameters.SetBatchSize(config.ring_dim / 2); parameters.SetMultiplicativeDepth(config.depth); parameters.SetScalingModSize(config.scaling_mod_bits); parameters.SetFirstModSize(config.first_mod_bits); parameters.SetSecurityLevel(fideslib::HEStd_NotSet); parameters.SetScalingTechnique(fideslib::FLEXIBLEAUTO); parameters.SetKeySwitchTechnique(fideslib::HYBRID); parameters.SetDevices(gpu_enabled ? std::vector<int>{0} : std::vector<int>{}); parameters.SetPlaintextAutoload(false); parameters.SetCiphertextAutoload(gpu_enabled);
-        auto context = fideslib::GenCryptoContext(parameters); context->Enable(fideslib::PKE); context->Enable(fideslib::KEYSWITCH); context->Enable(fideslib::LEVELEDSHE); return seal::SEALContext(std::move(context));
-#else
-        (void)gpu_enabled;
+    static seal::SEALContext make_context(const RunConfig &config) {
         seal::EncryptionParameters parameters(seal::scheme_type::ckks);
         parameters.set_poly_modulus_degree(static_cast<std::size_t>(config.ring_dim));
         // CPU SEAL uses a modulus chain matched to the configured CKKS scale.
@@ -177,9 +141,8 @@ private:
         if (!context.parameters_set())
             throw std::runtime_error("invalid CKKS parameters for the Microsoft SEAL CPU backend");
         return context;
-#endif
     }
-    ModelArtifact artifact_; RunConfig config_; bool gpu_enabled_; seal::SEALContext context_; seal::KeyGenerator keys_; seal::RelinKeys relin_keys_; seal::GaloisKeys galois_keys_; seal::Encryptor encryptor_; seal::Evaluator evaluator_; seal::CKKSEncoder encoder_; sealtorch::ScalarBackend scalar_backend_; sealtorch::PackedBackend packed_backend_; sealtorch::CiphertextModel model_; double scale_;
+    ModelArtifact artifact_; RunConfig config_; seal::SEALContext context_; seal::KeyGenerator keys_; seal::RelinKeys relin_keys_; seal::GaloisKeys galois_keys_; seal::Encryptor encryptor_; seal::Evaluator evaluator_; seal::CKKSEncoder encoder_; sealtorch::ScalarBackend scalar_backend_; sealtorch::PackedBackend packed_backend_; sealtorch::CiphertextModel model_; double scale_;
 };
 
 static double memory_mb() { std::ifstream file("/proc/self/status"); std::string line; while (std::getline(file, line)) if (line.rfind("VmRSS:", 0) == 0) { std::istringstream values(line.substr(6)); double kilobytes = 0; values >> kilobytes; return kilobytes / 1024.0; } return 0; }
@@ -195,8 +158,7 @@ static int run_web_worker() {
         if (rebuild) {
             const auto setup_start = std::chrono::steady_clock::now();
             inference = std::make_unique<WebInference>(load_model(selected_model), config);
-            // FIDES/CUDA may lazily load model data and kernels on the first
-            // prediction.  Run that work before measuring a benchmark sample.
+            // Build caches before measuring a benchmark sample.
             inference->predict(input);
             active_config = config;
             active_model = selected_model;
