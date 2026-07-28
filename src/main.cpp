@@ -170,14 +170,19 @@ public:
         : context_(make_context()), keys_(context_), encryptor_(context_, keys_.secret_key()), evaluator_(context_), encoder_(context_), model_(model), thread_count_(thread_count), packed_(packed), scale_(33554432.0), ciphertext_size_(0)
     {
         keys_.create_relin_keys(relin_keys_);
-        keys_.create_galois_keys(galois_keys_);
+        std::vector<int32_t> rotations;
+        for (const sealtorch::DenseLayer &layer : model_.model().layers()) {
+            for (int step = 1; step < layer.input_size; ++step) rotations.push_back(step);
+            for (int step = 1; step < layer.output_size; ++step) rotations.push_back(-step);
+        }
+        std::sort(rotations.begin(), rotations.end());
+        rotations.erase(std::unique(rotations.begin(), rotations.end()), rotations.end());
+        keys_.create_galois_keys(galois_keys_, rotations);
+        keys_.load_context();
         seal::Plaintext plain;
         encoder_.encode(std::vector<double>(model.input_size(), 0.0), scale_, plain);
         seal::Ciphertext encrypted;
         encryptor_.encrypt_symmetric(plain, encrypted);
-        std::ostringstream output;
-        encrypted.save(output, seal::compr_mode_type::none);
-        ciphertext_size_ = output.str().size();
     }
 
     std::vector<double> predict(const std::vector<double> &input)
@@ -197,7 +202,8 @@ public:
         if (packed_)
         {
             seal::Plaintext decoded;
-            decryptor.decrypt(output.front(), decoded);
+            seal::Ciphertext encrypted_output = output.front();
+            decryptor.decrypt(encrypted_output, decoded);
             encoder_.decode(decoded, values);
         }
         else
@@ -206,7 +212,8 @@ public:
             {
                 seal::Plaintext decoded_plain;
                 std::vector<double> decoded;
-                decryptor.decrypt(value, decoded_plain);
+                seal::Ciphertext encrypted_value = value;
+                decryptor.decrypt(encrypted_value, decoded_plain);
                 encoder_.decode(decoded_plain, decoded);
                 values.push_back(decoded.front());
             }
@@ -249,11 +256,25 @@ private:
 
     static seal::SEALContext make_context()
     {
-        seal::EncryptionParameters parameters(seal::scheme_type::ckks);
-        parameters.set_poly_modulus_degree(16384);
-        parameters.set_coeff_modulus(seal::CoeffModulus::Create(
-            16384, {40, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 40}));
-        return seal::SEALContext(parameters);
+        fideslib::CCParams<fideslib::CryptoContextCKKSRNS> parameters;
+        parameters.SetRingDim(16384);
+        parameters.SetBatchSize(8192);
+        parameters.SetMultiplicativeDepth(15);
+        parameters.SetScalingModSize(40);
+        parameters.SetFirstModSize(50);
+        // Preserve the original SEAL parameter set instead of letting
+        // OpenFHE raise the ring dimension to its automatic recommendation.
+        parameters.SetSecurityLevel(fideslib::HEStd_NotSet);
+        parameters.SetScalingTechnique(fideslib::FLEXIBLEAUTO);
+        parameters.SetKeySwitchTechnique(fideslib::HYBRID);
+        parameters.SetDevices({0});
+        parameters.SetPlaintextAutoload(false);
+        parameters.SetCiphertextAutoload(true);
+        auto context = fideslib::GenCryptoContext(parameters);
+        context->Enable(fideslib::PKE);
+        context->Enable(fideslib::KEYSWITCH);
+        context->Enable(fideslib::LEVELEDSHE);
+        return seal::SEALContext(std::move(context));
     }
 
     seal::SEALContext context_;

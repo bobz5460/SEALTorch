@@ -17,6 +17,18 @@ worker = subprocess.Popen([BUILD, "--web-worker", MODEL, THREADS, BACKEND], cwd=
                           text=True, bufsize=1)
 worker_lock = threading.Lock()
 
+def read_worker_json():
+    # FIDESlib reports GPU discovery on stdout while the worker starts.  The
+    # worker protocol itself is line-delimited JSON, so discard that startup
+    # diagnostic output before returning the next protocol message.
+    while True:
+        line = worker.stdout.readline()
+        if not line:
+            raise RuntimeError("inference worker exited before responding")
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, value, status=200):
         data = json.dumps(value).encode("utf-8")
@@ -57,7 +69,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("backend must be packed or scalar")
                 worker.stdin.write(json.dumps({"pixels": pixels, "backend": backend}) + "\n")
                 worker.stdin.flush()
-                result = json.loads(worker.stdout.readline())
+                result = read_worker_json()
             self.send_json(result)
         except Exception as error:
             self.send_json({"error": str(error)}, 400)

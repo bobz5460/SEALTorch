@@ -135,7 +135,10 @@ namespace sealtorch
 
         seal::Ciphertext result = encrypted_matrix_vector_product(
             context, evaluator, galois_keys, encoder, input,
-            layer.weights, input_width, output_width, scale, thread_count,
+            // FIDESlib owns shared CUDA context/scratch state. Its evaluator
+            // calls must not be issued concurrently from host threads.
+            layer.weights, input_width, output_width, scale,
+            std::min(thread_count, std::size_t{1}),
             thread_pool_,
             &cached_weights_[layer_index]);
         evaluator.rescale_to_next_inplace(result);
@@ -158,7 +161,8 @@ namespace sealtorch
     {
         std::vector<seal::Ciphertext> output(input.size());
         if (input.empty()) return output;
-        thread_pool_.parallel_for_workers(input.size(), thread_count, [&](std::size_t worker, std::size_t jobs) {
+        // See linear_packed: keep FIDESlib operations on one host thread.
+        thread_pool_.parallel_for_workers(input.size(), std::min(thread_count, std::size_t{1}), [&](std::size_t worker, std::size_t jobs) {
                 seal::Evaluator local_evaluator(context);
                 seal::CKKSEncoder local_encoder(context);
                 for (std::size_t index = worker; index < input.size(); index += jobs)
