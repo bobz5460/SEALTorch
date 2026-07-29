@@ -11,8 +11,9 @@ namespace sealtorch
     // Native ciphertexts are provider-specific. This API deliberately owns
     // them, so callers can switch providers without changing their inference
     // flow or accidentally mixing incompatible ciphertext formats.
-    // Selects where native homomorphic-encryption operations run.
-    enum class ExecutionTarget { Auto, CPU, CUDA };
+    // Selects where native homomorphic-encryption operations run. Use normal
+    // C++ type casing for new code; the all-caps spellings remain aliases.
+    enum class ExecutionTarget { Auto, Cpu, Cuda, CPU = Cpu, CUDA = Cuda };
     enum class CiphertextLayout { Packed, Scalar };
 
     struct CiphertextInferenceOptions

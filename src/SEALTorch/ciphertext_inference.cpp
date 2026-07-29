@@ -69,10 +69,12 @@ namespace sealtorch
                 result.input_ciphertext_bytes = ciphertext_bytes(options_);
                 const auto encrypt_end = std::chrono::steady_clock::now();
 
-                const CiphertextBackend &backend = options_.layout == CiphertextLayout::Packed
-                    ? static_cast<const CiphertextBackend &>(packed_backend_)
-                    : static_cast<const CiphertextBackend &>(scalar_backend_);
-                PredictionConfig config(context_, evaluator_, relin_keys_, galois_keys_, encoder_, scale_, backend, options_.thread_count);
+                const SealCiphertextBackend &backend = options_.layout == CiphertextLayout::Packed
+                    ? static_cast<const SealCiphertextBackend &>(packed_backend_)
+                    : static_cast<const SealCiphertextBackend &>(scalar_backend_);
+                SealInferenceConfig config(
+                    context_, evaluator_, relin_keys_, galois_keys_, encoder_, scale_, backend,
+                    options_.thread_count);
                 const auto evaluate_start = std::chrono::steady_clock::now();
                 const auto output = model_.predict({encrypted}, config);
                 const auto evaluate_end = std::chrono::steady_clock::now();
@@ -112,9 +114,9 @@ namespace sealtorch
             seal::Encryptor encryptor_;
             seal::Evaluator evaluator_;
             seal::CKKSEncoder encoder_;
-            ScalarBackend scalar_backend_;
-            PackedBackend packed_backend_;
-            CiphertextModel model_;
+            SealScalarBackend scalar_backend_;
+            SealPackedBackend packed_backend_;
+            SealCiphertextModel model_;
             double scale_;
         };
     }
@@ -132,9 +134,9 @@ namespace sealtorch
             if (options.thread_count == 0)
                 throw std::runtime_error("thread count must be greater than zero");
             target = options.target == ExecutionTarget::Auto
-                ? (cuda::cuda_available() ? ExecutionTarget::CUDA : ExecutionTarget::CPU)
+                ? (cuda::cuda_available() ? ExecutionTarget::Cuda : ExecutionTarget::Cpu)
                 : options.target;
-            if (target == ExecutionTarget::CUDA)
+            if (target == ExecutionTarget::Cuda)
             {
                 if (options.layout != CiphertextLayout::Packed)
                     throw std::runtime_error("CUDA encrypted inference currently supports packed ciphertexts only");

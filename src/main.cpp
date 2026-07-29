@@ -99,8 +99,8 @@ static RunConfig parse_config(const json::Value &request) {
 
 static sealtorch::CiphertextInferenceOptions ciphertext_inference_options(const RunConfig &config) {
     return {
-        config.device == "cpu" ? sealtorch::ExecutionTarget::CPU :
-        config.device == "cuda" ? sealtorch::ExecutionTarget::CUDA : sealtorch::ExecutionTarget::Auto,
+        config.device == "cpu" ? sealtorch::ExecutionTarget::Cpu :
+        config.device == "cuda" ? sealtorch::ExecutionTarget::Cuda : sealtorch::ExecutionTarget::Auto,
         config.packed ? sealtorch::CiphertextLayout::Packed : sealtorch::CiphertextLayout::Scalar,
         config.threads, static_cast<std::size_t>(config.ring_dim), static_cast<std::size_t>(config.depth),
         static_cast<std::size_t>(config.scaling_mod_bits), static_cast<std::size_t>(config.first_mod_bits),
@@ -130,7 +130,7 @@ static int run_web_worker() {
         }
         const double memory_before = memory_mb();
         const sealtorch::CiphertextInferenceResult encrypted = ciphertext_inference->predict(input);
-        const bool use_cuda = ciphertext_inference->target() == sealtorch::ExecutionTarget::CUDA;
+        const bool use_cuda = ciphertext_inference->target() == sealtorch::ExecutionTarget::Cuda;
         std::cout << "{\"encrypted\":"; print_numbers(encrypted.values); std::cout << ",\"setup_ms\":" << setup_ms << ",\"encrypt_ms\":" << encrypted.encrypt_ms << ",\"evaluate_ms\":" << encrypted.evaluate_ms << ",\"decrypt_ms\":" << encrypted.decrypt_ms << ",\"encrypted_ms\":" << encrypted.encrypt_ms + encrypted.evaluate_ms + encrypted.decrypt_ms << ",\"memory_before_mb\":" << memory_before << ",\"memory_after_mb\":" << memory_mb() << ",\"input_ciphertext_bytes\":" << encrypted.input_ciphertext_bytes << ",\"output_ciphertext_bytes\":" << encrypted.output_ciphertext_bytes << ",\"backend\":\"" << (config.packed ? "packed" : "scalar") << "\",\"device\":\"" << (use_cuda ? "cuda" : "cpu") << "\"}\n";
     } catch (const std::exception &error) { std::cout << "{\"error\":\"" << error.what() << "\"}\n"; }
     std::cout.flush();

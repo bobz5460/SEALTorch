@@ -11,13 +11,13 @@ namespace sealtorch
         throw std::runtime_error(std::string("backend does not implement ") + name);
     }
 
-    std::vector<seal::Ciphertext> CiphertextBackend::run(
+    std::vector<seal::Ciphertext> SealCiphertextBackend::run(
         const Sequential &model,
         Evaluator &evaluator,
         const std::vector<seal::Ciphertext> &input,
-        const PredictionConfig &config) const
+        const SealInferenceConfig &config) const
     {
-        CiphertextTensor values(input, std::vector<std::size_t>(1, input.size()));
+        SealCiphertextTensor values(input, std::vector<std::size_t>(1, input.size()));
         std::size_t dense_index = 0;
         for (const Operation &operation : model.operations())
         {
@@ -48,59 +48,59 @@ namespace sealtorch
         return values.values;
     }
 
-    CiphertextTensor CiphertextBackend::linear(
-        const CiphertextTensor &, const DenseLayer &, std::size_t,
-        Evaluator &, const PredictionConfig &) const
+    SealCiphertextTensor SealCiphertextBackend::linear(
+        const SealCiphertextTensor &, const DenseLayer &, std::size_t,
+        Evaluator &, const SealInferenceConfig &) const
     {
         unsupported("linear");
         return {};
     }
 
-    CiphertextTensor CiphertextBackend::activation(
-        const CiphertextTensor &, ActivationType, Evaluator &,
-        const PredictionConfig &) const
+    SealCiphertextTensor SealCiphertextBackend::activation(
+        const SealCiphertextTensor &, ActivationType, Evaluator &,
+        const SealInferenceConfig &) const
     {
         unsupported("activation");
         return {};
     }
 
-    CiphertextTensor CiphertextBackend::convolution2d(
-        const CiphertextTensor &, const Convolution2D &, Evaluator &,
-        const PredictionConfig &) const
+    SealCiphertextTensor SealCiphertextBackend::convolution2d(
+        const SealCiphertextTensor &, const Convolution2D &, Evaluator &,
+        const SealInferenceConfig &) const
     {
         unsupported("convolution2d");
         return {};
     }
 
-    CiphertextTensor CiphertextBackend::pool2d(
-        const CiphertextTensor &, const Pooling2D &, Evaluator &,
-        const PredictionConfig &) const
+    SealCiphertextTensor SealCiphertextBackend::pool2d(
+        const SealCiphertextTensor &, const Pooling2D &, Evaluator &,
+        const SealInferenceConfig &) const
     {
         unsupported("pool2d");
         return {};
     }
 
-    CiphertextTensor ScalarBackend::linear(
-        const CiphertextTensor &input,
+    SealCiphertextTensor SealScalarBackend::linear(
+        const SealCiphertextTensor &input,
         const DenseLayer &layer,
         std::size_t,
         Evaluator &evaluator,
-        const PredictionConfig &config) const
+        const SealInferenceConfig &config) const
     {
-        return CiphertextTensor(
+        return SealCiphertextTensor(
             evaluator.linear_scalar(
                 input.values, layer, *config.evaluator,
                 *config.galois_keys, *config.encoder, config.scale),
             std::vector<std::size_t>(1, layer.output_size));
     }
 
-    CiphertextTensor ScalarBackend::activation(
-        const CiphertextTensor &input,
+    SealCiphertextTensor SealScalarBackend::activation(
+        const SealCiphertextTensor &input,
         ActivationType type,
         Evaluator &evaluator,
-        const PredictionConfig &config) const
+        const SealInferenceConfig &config) const
     {
-        return CiphertextTensor(
+        return SealCiphertextTensor(
             evaluator.activation(
                 input.values, type, *config.context, *config.evaluator,
                 *config.relin_keys, *config.encoder, config.scale,
@@ -108,12 +108,12 @@ namespace sealtorch
             input.shape);
     }
 
-    CiphertextTensor PackedBackend::linear(
-        const CiphertextTensor &input,
+    SealCiphertextTensor SealPackedBackend::linear(
+        const SealCiphertextTensor &input,
         const DenseLayer &layer,
         std::size_t layer_index,
         Evaluator &evaluator,
-        const PredictionConfig &config) const
+        const SealInferenceConfig &config) const
     {
         if (config.context == nullptr)
             throw std::runtime_error("packed prediction needs a SEAL context");
@@ -125,17 +125,17 @@ namespace sealtorch
             *config.context, input.values.front(), layer, layer_index,
             *config.evaluator, *config.galois_keys, *config.encoder,
             config.scale, config.thread_count);
-        return CiphertextTensor(
+        return SealCiphertextTensor(
             std::move(output), std::vector<std::size_t>(1, layer.output_size));
     }
 
-    CiphertextTensor PackedBackend::activation(
-        const CiphertextTensor &input,
+    SealCiphertextTensor SealPackedBackend::activation(
+        const SealCiphertextTensor &input,
         ActivationType type,
         Evaluator &evaluator,
-        const PredictionConfig &config) const
+        const SealInferenceConfig &config) const
     {
-        return CiphertextTensor(
+        return SealCiphertextTensor(
             evaluator.activation(
                 input.values, type, *config.context, *config.evaluator,
                 *config.relin_keys, *config.encoder, config.scale,
@@ -143,14 +143,14 @@ namespace sealtorch
             input.shape);
     }
 
-    CiphertextModel::CiphertextModel(Sequential model)
+    SealCiphertextModel::SealCiphertextModel(Sequential model)
         : evaluator_(std::move(model))
     {
     }
 
-    std::vector<seal::Ciphertext> CiphertextModel::predict(
+    std::vector<seal::Ciphertext> SealCiphertextModel::predict(
         const std::vector<seal::Ciphertext> &input,
-        const PredictionConfig &config) const
+        const SealInferenceConfig &config) const
     {
         if (input.empty()) throw std::runtime_error("prediction input is empty");
         if (config.thread_count == 0) throw std::runtime_error("thread count must be greater than zero");
@@ -163,13 +163,13 @@ namespace sealtorch
         return config.backend->run(model(), evaluator_, input, config);
     }
 
-    CiphertextTensor CiphertextModel::predict(
-        const CiphertextTensor &input,
-        const PredictionConfig &config) const
+    SealCiphertextTensor SealCiphertextModel::predict(
+        const SealCiphertextTensor &input,
+        const SealInferenceConfig &config) const
     {
         const std::vector<seal::Ciphertext> output = predict(input.values, config);
-        return CiphertextTensor(output, std::vector<std::size_t>(1, output.size()));
+        return SealCiphertextTensor(output, std::vector<std::size_t>(1, output.size()));
     }
 
-    const Sequential &CiphertextModel::model() const { return evaluator_.model(); }
+    const Sequential &SealCiphertextModel::model() const { return evaluator_.model(); }
 }

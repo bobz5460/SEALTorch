@@ -150,6 +150,24 @@ def gpu_power_watts():
         return None
 
 
+def platform_power_watts():
+    """Read the Intel Node Manager total-node meter when the host exposes it.
+
+    This is deliberately not used as a CPU measurement: the kernel describes
+    this domain as total node power, so it can include memory and other board
+    components.  hwmon power values are expressed in microwatts.
+    """
+    try:
+        for directory in pathlib.Path("/sys/class/hwmon").glob("hwmon*"):
+            if directory.joinpath("name").read_text().strip() != "power_meter":
+                continue
+            value = int(directory.joinpath("power1_average").read_text().strip())
+            return value / 1_000_000
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def cpu_energy_snapshot():
     """Return CPU *package* RAPL counters, without double-counting subdomains.
 
@@ -192,7 +210,8 @@ def cpu_energy_snapshot():
 
 
 def telemetry_snapshot():
-    return {"gpu_power_w": gpu_power_watts(), "cpu": cpu_energy_snapshot()}
+    return {"gpu_power_w": gpu_power_watts(), "platform_power_w": platform_power_watts(),
+            "cpu": cpu_energy_snapshot()}
 
 
 def usage_telemetry(before, after, elapsed_seconds):
@@ -200,6 +219,9 @@ def usage_telemetry(before, after, elapsed_seconds):
     gpu_power = None
     if before["gpu_power_w"] is not None and after["gpu_power_w"] is not None:
         gpu_power = (before["gpu_power_w"] + after["gpu_power_w"]) / 2
+    platform_power = None
+    if before["platform_power_w"] is not None and after["platform_power_w"] is not None:
+        platform_power = (before["platform_power_w"] + after["platform_power_w"]) / 2
     cpu_energy = None
     cpu_reason = after["cpu"]["reason"] or before["cpu"]["reason"]
     before_counters, after_counters = before["cpu"]["counters"], after["cpu"]["counters"]
@@ -226,6 +248,8 @@ def usage_telemetry(before, after, elapsed_seconds):
         "gpu_power_w": gpu_power,
         "cpu_power_w": cpu_energy / elapsed_seconds if cpu_energy is not None and elapsed_seconds else None,
         "gpu_energy_j": gpu_energy,
+        "platform_power_w": platform_power,
+        "platform_energy_j": platform_power * elapsed_seconds if platform_power is not None else None,
         "cpu_energy_j": cpu_energy,
         "total_energy_j": sum(known_energy) if known_energy else None,
         "total_power_w": (sum(value for value in (gpu_power, cpu_energy / elapsed_seconds if cpu_energy is not None and elapsed_seconds else None) if value is not None)
@@ -235,6 +259,8 @@ def usage_telemetry(before, after, elapsed_seconds):
         "cpu_energy_method": "RAPL CPU package counters" if cpu_energy is not None else None,
         "cpu_power_reason": cpu_reason,
         "gpu_power_reason": "NVIDIA power sensor is unavailable" if gpu_power is None else None,
+        "platform_power_method": "Intel Node Manager total-node meter (1 s rolling average)" if platform_power is not None else None,
+        "platform_power_reason": "No readable total-node power meter is exposed by this host" if platform_power is None else None,
     }
 
 
