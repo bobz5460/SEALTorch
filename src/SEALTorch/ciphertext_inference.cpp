@@ -1,6 +1,7 @@
 #include <SEALTorch/ciphertext_inference.h>
 
 #include <SEALTorch/cuda_ciphertext_inference.h>
+#include <SEALTorch/packing.h>
 #include <SEALTorch/seal_ciphertext_backend.h>
 
 #include <algorithm>
@@ -56,11 +57,27 @@ namespace sealtorch
                   model_(std::move(model)), scale_(std::ldexp(1.0, static_cast<int>(options_.scale_bits)))
             {
                 keys_.create_relin_keys(relin_keys_);
-                std::vector<int32_t> rotations;
-                for (const DenseLayer &layer : model_.model().layers())
+                std::vector<std::int32_t> rotations;
+                const std::size_t slot_count = encoder_.slot_count();
+                for (const Operation &operation : model_.model().operations())
                 {
-                    for (int step = 1; step < layer.input_size; ++step) rotations.push_back(step);
-                    for (int step = 1; step < layer.output_size; ++step) rotations.push_back(-step);
+                    if (operation.kind != OperationKind::Linear)
+                        continue;
+
+                    for (std::size_t diagonal :
+                         active_diagonals(operation.linear_layer, slot_count))
+                    {
+                        const DiagonalSplit split =
+                            split_diagonal(diagonal, slot_count);
+                        const std::int32_t baby_rotation =
+                            signed_rotation(split.baby, slot_count);
+                        const std::int32_t giant_rotation =
+                            signed_rotation(split.giant, slot_count);
+                        if (baby_rotation != 0)
+                            rotations.push_back(baby_rotation);
+                        if (giant_rotation != 0)
+                            rotations.push_back(giant_rotation);
+                    }
                 }
                 std::sort(rotations.begin(), rotations.end());
                 rotations.erase(std::unique(rotations.begin(), rotations.end()), rotations.end());
@@ -161,9 +178,16 @@ namespace sealtorch
             {
                 if (options.layout != CiphertextLayout::Packed)
                     throw std::runtime_error("CUDA encrypted inference currently supports packed ciphertexts only");
-                cuda_engine = std::make_unique<cuda::CiphertextInferenceEngine>(std::move(model), cuda::CiphertextInferenceOptions{
-                    options.ring_dimension, options.multiplicative_depth, options.scaling_modulus_bits,
-                    options.first_modulus_bits, options.cuda_device});
+                cuda::CiphertextInferenceOptions cuda_options{
+                    options.ring_dimension,
+                    options.multiplicative_depth,
+                    options.scaling_modulus_bits,
+                    options.first_modulus_bits,
+                    options.cuda_device,
+                };
+                cuda_engine =
+                    std::make_unique<cuda::CiphertextInferenceEngine>(
+                        std::move(model), cuda_options);
             }
             else
                 cpu_inference = std::make_unique<CpuCiphertextInference>(std::move(model), options);
@@ -190,7 +214,11 @@ namespace sealtorch
     CiphertextInference::~CiphertextInference() = default;
     CiphertextInference::CiphertextInference(CiphertextInference &&) noexcept = default;
     CiphertextInference &CiphertextInference::operator=(CiphertextInference &&) noexcept = default;
-    CiphertextInferenceResult CiphertextInference::predict(const std::vector<double> &input) { return implementation_->predict(input); }
+    CiphertextInferenceResult CiphertextInference::predict(
+        const std::vector<double> &input)
+    {
+        return implementation_->predict(input);
+    }
     ExecutionTarget CiphertextInference::target() const { return implementation_->target; }
     bool CiphertextInference::cuda_available() { return cuda::cuda_available(); }
 }

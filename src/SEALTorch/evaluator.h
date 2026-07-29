@@ -2,6 +2,7 @@
 
 #include <seal/seal.h>
 #include <SEALTorch/model.h>
+#include <SEALTorch/math.h>
 #include <SEALTorch/thread_pool.h>
 
 #include <cstddef>
@@ -39,15 +40,13 @@ namespace sealtorch
             const std::vector<seal::Ciphertext> &input,
             ActivationType type,
             const seal::SEALContext &context,
-            const seal::Evaluator &evaluator,
             const seal::RelinKeys &relin_keys,
-            seal::CKKSEncoder &encoder,
             double scale,
             std::size_t thread_count) const;
 
     private:
         Sequential model_;
-        mutable std::vector<std::vector<seal::Plaintext>> cached_weights_;
+        mutable std::vector<EncodedMatrix> cached_weights_;
         mutable std::vector<seal::parms_id_type> cached_parms_;
         mutable ThreadPool thread_pool_{1};
     };

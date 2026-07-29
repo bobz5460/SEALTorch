@@ -25,7 +25,7 @@ namespace sealtorch
         std::size_t multiplicative_depth = 15;
         std::size_t scaling_modulus_bits = 40;
         std::size_t first_modulus_bits = 50;
-        std::size_t scale_bits = 25;
+        std::size_t scale_bits = 40;
         int cuda_device = 0;
     };
 

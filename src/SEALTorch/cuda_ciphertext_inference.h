@@ -2,8 +2,6 @@
 
 #include <SEALTorch/model.h>
 
-#include <fideslib.hpp>
-
 #include <cstddef>
 #include <memory>
 #include <vector>

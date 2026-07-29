@@ -1,9 +1,11 @@
 #include "evaluator.h"
 
 #include "math.h"
+#include "packing.h"
 
 #include <stdexcept>
 #include <algorithm>
+#include <map>
 #include <thread>
 #include <utility>
 
@@ -106,41 +108,67 @@ namespace sealtorch
 
         const std::size_t input_width = layer.input_size;
         const std::size_t output_width = layer.output_size;
-        if (cached_weights_[layer_index].empty() ||
+        if (cached_weights_[layer_index].groups.empty() ||
             cached_parms_[layer_index] != input.parms_id())
         {
-            const std::size_t size = encoder.slot_count();
-            cached_weights_[layer_index].resize(size);
-            std::vector<bool> used(size, false);
-            for (std::size_t row = 0; row < output_width; ++row)
-                for (std::size_t column = 0; column < input_width; ++column)
-                    used[(column + size - row) % size] = true;
+            const std::size_t slot_count = encoder.slot_count();
+            const std::vector<std::size_t> diagonals =
+                active_diagonals(layer, slot_count);
+            EncodedMatrix encoded_matrix;
+            std::map<std::size_t, std::size_t> baby_indices;
+            std::map<std::size_t, std::size_t> group_indices;
 
-            for (std::size_t diagonal = 0; diagonal < size; ++diagonal)
+            for (std::size_t diagonal : diagonals)
             {
-                if (!used[diagonal]) continue;
-                std::vector<double> values(output_width, 0.0);
+                const DiagonalSplit split =
+                    split_diagonal(diagonal, slot_count);
+
+                if (baby_indices.find(split.baby) == baby_indices.end())
+                {
+                    const std::size_t index =
+                        encoded_matrix.input_rotations.size();
+                    baby_indices[split.baby] = index;
+                    encoded_matrix.input_rotations.push_back(
+                        signed_rotation(split.baby, slot_count));
+                }
+
+                if (group_indices.find(split.giant) == group_indices.end())
+                {
+                    const std::size_t index = encoded_matrix.groups.size();
+                    group_indices[split.giant] = index;
+                    EncodedDiagonalGroup group;
+                    group.rotation =
+                        signed_rotation(split.giant, slot_count);
+                    encoded_matrix.groups.push_back(std::move(group));
+                }
+
+                std::vector<double> values(slot_count, 0.0);
                 for (std::size_t row = 0; row < output_width; ++row)
                 {
-                    const std::size_t column = (row + diagonal) % size;
+                    const std::size_t column = (row + diagonal) % slot_count;
                     if (column < input_width)
-                        values[row] = layer.weights[row][column];
+                    {
+                        const std::size_t shifted_row =
+                            (row + split.giant) % slot_count;
+                        values[shifted_row] = layer.weights[row][column];
+                    }
                 }
-                encoder.encode(values, scale, cached_weights_[layer_index][diagonal]);
+
+                EncodedDiagonal encoded;
+                encoded.input_index = baby_indices.at(split.baby);
+                encoder.encode(values, scale, encoded.weights);
                 evaluator.mod_switch_to_inplace(
-                    cached_weights_[layer_index][diagonal], input.parms_id());
+                    encoded.weights, input.parms_id());
+                encoded_matrix.groups[group_indices.at(split.giant)]
+                    .diagonals.push_back(std::move(encoded));
             }
+            cached_weights_[layer_index] = std::move(encoded_matrix);
             cached_parms_[layer_index] = input.parms_id();
         }
 
         seal::Ciphertext result = encrypted_matrix_vector_product(
-            context, evaluator, galois_keys, encoder, input,
-            // FIDESlib owns shared CUDA context/scratch state. Its evaluator
-            // calls must not be issued concurrently from host threads.
-            layer.weights, input_width, output_width, scale,
-            std::min(thread_count, std::size_t{1}),
-            thread_pool_,
-            &cached_weights_[layer_index]);
+            context, evaluator, galois_keys, input,
+            cached_weights_[layer_index], thread_count, thread_pool_);
         evaluator.rescale_to_next_inplace(result);
         seal::Plaintext bias;
         encoder.encode(layer.biases, result.scale(), bias);
@@ -153,22 +181,21 @@ namespace sealtorch
         const std::vector<seal::Ciphertext> &input,
         ActivationType type,
         const seal::SEALContext &context,
-        const seal::Evaluator &evaluator,
         const seal::RelinKeys &relin_keys,
-        seal::CKKSEncoder &encoder,
         double scale,
         std::size_t thread_count) const
     {
         std::vector<seal::Ciphertext> output(input.size());
         if (input.empty()) return output;
-        // See linear_packed: keep FIDESlib operations on one host thread.
-        thread_pool_.parallel_for_workers(input.size(), std::min(thread_count, std::size_t{1}), [&](std::size_t worker, std::size_t jobs) {
+        thread_pool_.parallel_for_workers(input.size(), thread_count, [&](std::size_t worker, std::size_t jobs) {
                 seal::Evaluator local_evaluator(context);
                 seal::CKKSEncoder local_encoder(context);
                 for (std::size_t index = worker; index < input.size(); index += jobs)
                     output[index] = type == ActivationType::Relu
                         ? approximate_relu(local_evaluator, relin_keys, local_encoder, input[index], scale)
-                        : approximate_gelu(local_evaluator, relin_keys, local_encoder, input[index], scale);
+                        : type == ActivationType::Gelu
+                            ? approximate_gelu(local_evaluator, relin_keys, local_encoder, input[index], scale)
+                            : approximate_tanh(local_evaluator, relin_keys, local_encoder, input[index], scale);
             });
         return output;
     }

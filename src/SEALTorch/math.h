@@ -9,6 +9,24 @@ namespace sealtorch
 {
     class ThreadPool;
 
+    struct EncodedDiagonal
+    {
+        std::size_t input_index = 0;
+        seal::Plaintext weights;
+    };
+
+    struct EncodedDiagonalGroup
+    {
+        int rotation = 0;
+        std::vector<EncodedDiagonal> diagonals;
+    };
+
+    struct EncodedMatrix
+    {
+        std::vector<int> input_rotations;
+        std::vector<EncodedDiagonalGroup> groups;
+    };
+
     seal::Ciphertext encrypted_dot_product(
         const seal::Evaluator &evaluator,
         const seal::GaloisKeys &galois_keys,
@@ -22,15 +40,10 @@ namespace sealtorch
         const seal::SEALContext& context,
         const seal::Evaluator& evaluator,
         const seal::GaloisKeys& galois_keys,
-        seal::CKKSEncoder& encoder,
         const seal::Ciphertext& input,
-        const std::vector<std::vector<double>>& weights,
-        std::size_t input_width,
-        std::size_t output_width,
-        double scale,
+        const EncodedMatrix& matrix,
         std::size_t thread_count,
-        ThreadPool &thread_pool,
-        const std::vector<seal::Plaintext> *cached_weights);
+        ThreadPool &thread_pool);
 
     // Degree-four polynomial approximation of ReLU, range-normalized for
     // the exported MNIST MLP's approximately [-10, 10] activations.
@@ -56,6 +69,14 @@ namespace sealtorch
     // must have at least three rescaling levels available, and the caller's
     // scale should match the scale used to encrypt input.
     seal::Ciphertext approximate_gelu(
+        const seal::Evaluator& evaluator,
+        const seal::RelinKeys& relin_keys,
+        seal::CKKSEncoder& encoder,
+        const seal::Ciphertext& input,
+        double scale);
+
+    // Odd degree-three fit of tanh on LeNet's usual activation range.
+    seal::Ciphertext approximate_tanh(
         const seal::Evaluator& evaluator,
         const seal::RelinKeys& relin_keys,
         seal::CKKSEncoder& encoder,

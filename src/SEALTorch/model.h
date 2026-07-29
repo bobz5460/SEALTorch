@@ -40,7 +40,7 @@ namespace sealtorch
         std::size_t stride = 2;
     };
 
-    enum class ActivationType { Relu, Gelu };
+    enum class ActivationType { Relu, Gelu, Tanh };
 
     enum class OperationKind
     {
@@ -153,6 +153,7 @@ namespace sealtorch
     public:
         static Activation relu() { return Activation(ActivationType::Relu); }
         static Activation gelu() { return Activation(ActivationType::Gelu); }
+        static Activation tanh() { return Activation(ActivationType::Tanh); }
         ActivationType type() const { return type_; }
 
     private:
@@ -246,6 +247,22 @@ namespace sealtorch
                 for (const std::vector<double> &row : layer.weights)
                     if (row.size() != static_cast<std::size_t>(layer.input_size))
                         throw std::runtime_error("invalid dense layer weight dimensions");
+            }
+            else if (operation.kind == OperationKind::Convolution2D)
+            {
+                const Convolution2D &layer = operation.convolution_layer;
+                const std::size_t expected = layer.output_channels * layer.input_channels *
+                    layer.kernel_height * layer.kernel_width;
+                if (layer.input_channels == 0 || layer.output_channels == 0 ||
+                    layer.kernel_height == 0 || layer.kernel_width == 0 || layer.stride == 0 ||
+                    layer.weights.size() != expected || layer.biases.size() != layer.output_channels)
+                    throw std::runtime_error("invalid convolution dimensions");
+            }
+            else if (operation.kind == OperationKind::Pooling2D)
+            {
+                const Pooling2D &layer = operation.pooling_layer;
+                if (layer.height == 0 || layer.width == 0 || layer.stride == 0)
+                    throw std::runtime_error("invalid pooling dimensions");
             }
         }
 

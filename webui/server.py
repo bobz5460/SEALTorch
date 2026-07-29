@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 import urllib.request
+from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -25,36 +26,88 @@ BUILD_DIR = pathlib.Path(os.environ.get("SEALTORCH_BUILD_DIR", ROOT / "build"))
 HE_BINARY = pathlib.Path(os.environ.get("SEALTORCH_HE_BINARY", BUILD_DIR / "sealtorch_gui"))
 RESULTS_DIR = ROOT / "results"
 MNIST_DIR = ROOT / "data" / "MNIST" / "raw"
-plaintext_models = {}
+MAX_PLAINTEXT_MODELS = 2
+plaintext_models = OrderedDict()
+plaintext_models_lock = threading.Lock()
 benchmark_jobs = {}
 
 
 def plaintext_model(name, device):
     cache_key = (name, device)
-    if cache_key in plaintext_models:
-        return plaintext_models[cache_key], False
-    path = ROOT / "src" / ("mnist_mlp_gelu.json" if name == "gelu" else "mnist_mlp.json")
-    artifact = json.loads(path.read_text())
-    layers = artifact["model"]["layers"]
-    tensors = artifact["tensors"]
-    modules = []
-    linear_index = 0
-    for item in layers:
-        if item["type"] == "Linear":
-            key = ("network.1", "network.3", "network.5")[linear_index]
-            module = torch.nn.Linear(item["in_features"], item["out_features"])
-            with torch.no_grad():
-                module.weight.copy_(torch.tensor(tensors[key + ".weight"]["data"], dtype=torch.float32))
-                module.bias.copy_(torch.tensor(tensors[key + ".bias"]["data"], dtype=torch.float32))
-            modules.append(module)
-            linear_index += 1
-        elif item["type"] == "ReLU":
-            modules.append(torch.nn.ReLU())
-        elif "GELU" in item["type"]:
-            modules.append(torch.nn.GELU())
-    model = torch.nn.Sequential(*modules).eval().to(device)
-    plaintext_models[cache_key] = model
-    return model, True
+    with plaintext_models_lock:
+        if cache_key in plaintext_models:
+            model = plaintext_models.pop(cache_key)
+            plaintext_models[cache_key] = model
+            return model, False
+
+        paths = {
+            "relu": "mnist_mlp.json",
+            "gelu": "mnist_mlp_gelu.json",
+            "lenet": "lenet.json",
+        }
+        if name not in paths:
+            raise ValueError("model must be relu, gelu, or lenet")
+        path = ROOT / "src" / paths[name]
+        artifact = json.loads(path.read_text())
+        layers = artifact["model"]["layers"]
+        tensors = artifact["tensors"]
+        modules = []
+        linear_index = 0
+        convolution_index = 0
+
+        for item in layers:
+            layer_type = item["type"]
+            if layer_type == "Linear":
+                prefixes = (
+                    ("classifier.1", "classifier.3", "classifier.5")
+                    if name == "lenet"
+                    else ("network.1", "network.3", "network.5")
+                )
+                prefix = prefixes[linear_index]
+                module = torch.nn.Linear(
+                    item["in_features"], item["out_features"])
+                copy_parameters(module, tensors, prefix)
+                modules.append(module)
+                linear_index += 1
+            elif layer_type == "Conv2d":
+                prefix = ("features.0", "features.3")[convolution_index]
+                module = torch.nn.Conv2d(
+                    item["in_channels"],
+                    item["out_channels"],
+                    item["kernel_size"],
+                )
+                copy_parameters(module, tensors, prefix)
+                modules.append(module)
+                convolution_index += 1
+            elif layer_type == "AvgPool2d":
+                modules.append(torch.nn.AvgPool2d(
+                    item["kernel_size"],
+                    item.get("stride", item["kernel_size"]),
+                ))
+            elif layer_type == "Flatten":
+                modules.append(torch.nn.Flatten())
+            elif layer_type == "ReLU":
+                modules.append(torch.nn.ReLU())
+            elif "GELU" in layer_type:
+                modules.append(torch.nn.GELU())
+            elif layer_type == "Tanh":
+                modules.append(torch.nn.Tanh())
+
+        model = torch.nn.Sequential(*modules).eval().to(device)
+        plaintext_models[cache_key] = model
+        while len(plaintext_models) > MAX_PLAINTEXT_MODELS:
+            plaintext_models.popitem(last=False)
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return model, True
+
+
+def copy_parameters(module, tensors, prefix):
+    with torch.no_grad():
+        module.weight.copy_(torch.tensor(
+            tensors[prefix + ".weight"]["data"], dtype=torch.float32))
+        module.bias.copy_(torch.tensor(
+            tensors[prefix + ".bias"]["data"], dtype=torch.float32))
 
 
 def run_plaintext(pixels, name, requested_device):
@@ -62,10 +115,18 @@ def run_plaintext(pixels, name, requested_device):
         raise ValueError("device must be auto, cpu, or cuda")
     if requested_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but PyTorch has no available CUDA device")
-    device = "cuda" if requested_device == "cuda" or (requested_device == "auto" and torch.cuda.is_available()) else "cpu"
+    use_cuda = (
+        requested_device == "cuda"
+        or (requested_device == "auto" and torch.cuda.is_available())
+    )
+    device = "cuda" if use_cuda else "cpu"
     setup_started = time.perf_counter()
     model, initialized = plaintext_model(name, device)
     value = torch.tensor(pixels, dtype=torch.float32, device=device)
+    if name == "lenet":
+        value = value.reshape(1, 1, 28, 28)
+    else:
+        value = value.reshape(1, 784)
 
     # CUDA may defer allocation and kernel/module loading until the first
     # invocation.  Warm a newly cached model before starting the inference
@@ -81,7 +142,7 @@ def run_plaintext(pixels, name, requested_device):
     with torch.inference_mode():
         output = model(value)
     if device == "cuda": torch.cuda.synchronize()
-    return output.cpu().double().tolist(), (time.perf_counter() - started) * 1000, device, setup_ms
+    return output.reshape(-1).cpu().double().tolist(), (time.perf_counter() - started) * 1000, device, setup_ms
 
 
 class HEWorker:
@@ -136,6 +197,23 @@ def select_he_backend(requested_device):
     if not HE_BINARY.exists():
         raise RuntimeError(f"SEALTorch worker is not built ({HE_BINARY}). Run cmake --build build.")
     return HE_BINARY
+
+
+def he_capabilities():
+    if not HE_BINARY.exists():
+        return {"cpu": False, "cuda": False}
+    try:
+        output = subprocess.run(
+            [str(HE_BINARY), "--capabilities"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        return json.loads(output.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {"cpu": True, "cuda": False}
 
 
 def gpu_power_watts():
@@ -196,8 +274,12 @@ def cpu_energy_snapshot():
             except OSError:
                 unreadable = True
     if not packages:
+        if unreadable:
+            reason = "CPU package RAPL counters exist but are not readable"
+        else:
+            reason = "No CPU package RAPL counters are exposed by this host"
         return {"counters": None,
-                "reason": "No CPU package RAPL counters are exposed by this host"}
+                "reason": reason}
     counters = []
     try:
         for package in packages:
@@ -243,36 +325,68 @@ def usage_telemetry(before, after, elapsed_seconds):
             else:
                 cpu_energy = sum(deltas) / 1_000_000
     gpu_energy = gpu_power * elapsed_seconds if gpu_power is not None else None
-    known_energy = [value for value in (cpu_energy, gpu_energy) if value is not None]
+    cpu_power = None
+    if cpu_energy is not None and elapsed_seconds:
+        cpu_power = cpu_energy / elapsed_seconds
+    known_energy = [
+        value for value in (cpu_energy, gpu_energy)
+        if value is not None
+    ]
+    known_power = [
+        value for value in (cpu_power, gpu_power)
+        if value is not None
+    ]
     return {
         "gpu_power_w": gpu_power,
-        "cpu_power_w": cpu_energy / elapsed_seconds if cpu_energy is not None and elapsed_seconds else None,
+        "cpu_power_w": cpu_power,
         "gpu_energy_j": gpu_energy,
         "platform_power_w": platform_power,
-        "platform_energy_j": platform_power * elapsed_seconds if platform_power is not None else None,
+        "platform_energy_j": (
+            platform_power * elapsed_seconds
+            if platform_power is not None
+            else None
+        ),
         "cpu_energy_j": cpu_energy,
         "total_energy_j": sum(known_energy) if known_energy else None,
-        "total_power_w": (sum(value for value in (gpu_power, cpu_energy / elapsed_seconds if cpu_energy is not None and elapsed_seconds else None) if value is not None)
-                          if gpu_power is not None or cpu_energy is not None else None),
+        "total_power_w": sum(known_power) if known_power else None,
         "wall_ms": elapsed_seconds * 1000,
-        "gpu_energy_method": "two-point power estimate" if gpu_energy is not None else None,
-        "cpu_energy_method": "RAPL CPU package counters" if cpu_energy is not None else None,
+        "gpu_energy_method": (
+            "two-point power estimate" if gpu_energy is not None else None
+        ),
+        "cpu_energy_method": (
+            "RAPL CPU package counters" if cpu_energy is not None else None
+        ),
         "cpu_power_reason": cpu_reason,
-        "gpu_power_reason": "NVIDIA power sensor is unavailable" if gpu_power is None else None,
-        "platform_power_method": "Intel Node Manager total-node meter (1 s rolling average)" if platform_power is not None else None,
-        "platform_power_reason": "No readable total-node power meter is exposed by this host" if platform_power is None else None,
+        "gpu_power_reason": (
+            "NVIDIA power sensor is unavailable"
+            if gpu_power is None
+            else None
+        ),
+        "platform_power_method": (
+            "Intel Node Manager total-node meter (1 s rolling average)"
+            if platform_power is not None
+            else None
+        ),
+        "platform_power_reason": (
+            "No readable total-node power meter is exposed by this host"
+            if platform_power is None
+            else None
+        ),
     }
 
 
-def execute(request):
+def execute(request, collect_telemetry=True):
     config = request.get("config", {})
     engine = config.get("engine", "he")
     model = request.get("model", "relu")
     if engine not in ("he", "pytorch"):
         raise ValueError("engine must be he or pytorch")
-    before, started = telemetry_snapshot(), time.monotonic()
+    validate_pixels(request.get("pixels"))
+    before = telemetry_snapshot() if collect_telemetry else None
+    started = time.monotonic()
     if engine == "pytorch":
-        output, runtime_ms, device, setup_ms = run_plaintext(request["pixels"], model, config.get("device", "auto"))
+        output, runtime_ms, device, setup_ms = run_plaintext(
+            request["pixels"], model, config.get("device", "auto"))
         result = {
             "engine": "pytorch", "device": device, "output": output,
             "execution_ms": runtime_ms, "plain_ms": runtime_ms,
@@ -287,12 +401,23 @@ def execute(request):
             # FIDESlib CUDA. Keep that observed value rather than echoing it.
             result["output"] = result["encrypted"]
             result["execution_ms"] = result["encrypted_ms"]
-            result["setup_ms"] = result.get("setup_ms", 0) + result.get("worker_startup_ms", 0)
+            result["setup_ms"] = (
+                result.get("setup_ms", 0)
+                + result.get("worker_startup_ms", 0)
+            )
     elapsed = time.monotonic() - started
-    after = telemetry_snapshot()
-    if "error" not in result:
-        result["telemetry"] = usage_telemetry(before, after, elapsed)
+    if "error" not in result and collect_telemetry:
+        result["telemetry"] = usage_telemetry(
+            before, telemetry_snapshot(), elapsed)
     return result
+
+
+def validate_pixels(pixels):
+    if not isinstance(pixels, list) or len(pixels) != 784:
+        raise ValueError("pixels must contain 784 values")
+    for pixel in pixels:
+        if not isinstance(pixel, (int, float)) or not 0 <= pixel <= 1:
+            raise ValueError("pixels must be numbers between 0 and 1")
 
 
 def read_idx(path, expected_magic):
@@ -305,20 +430,48 @@ def read_idx(path, expected_magic):
             raise ValueError(f"unexpected MNIST IDX header in {path}")
         count = int.from_bytes(file.read(4), "big")
         if expected_magic == 2051:
-            rows, columns = int.from_bytes(file.read(4), "big"), int.from_bytes(file.read(4), "big")
-            if (rows, columns) != (28, 28): raise ValueError("MNIST images must be 28×28")
-            return [list(file.read(784)) for _ in range(count)]
-        return list(file.read(count))
+            rows = int.from_bytes(file.read(4), "big")
+            columns = int.from_bytes(file.read(4), "big")
+            if (rows, columns) != (28, 28):
+                raise ValueError("MNIST images must be 28×28")
+            data = file.read(count * 784)
+            if len(data) != count * 784:
+                raise ValueError(f"truncated MNIST image data in {path}")
+            return [
+                list(data[offset:offset + 784])
+                for offset in range(0, len(data), 784)
+            ]
+        data = file.read(count)
+        if len(data) != count:
+            raise ValueError(f"truncated MNIST label data in {path}")
+        return list(data)
 
 
 def mnist_validation_set():
     roots = [MNIST_DIR, ROOT / "data", ROOT / "mnist"]
+    image_names = (
+        "t10k-images-idx3-ubyte",
+        "t10k-images-idx3-ubyte.gz",
+    )
+    label_names = (
+        "t10k-labels-idx1-ubyte",
+        "t10k-labels-idx1-ubyte.gz",
+    )
     for root in roots:
-        image = next((root / name for name in ("t10k-images-idx3-ubyte", "t10k-images-idx3-ubyte.gz") if (root / name).exists()), None)
-        label = next((root / name for name in ("t10k-labels-idx1-ubyte", "t10k-labels-idx1-ubyte.gz") if (root / name).exists()), None)
+        image = next(
+            (root / name for name in image_names if (root / name).exists()),
+            None,
+        )
+        label = next(
+            (root / name for name in label_names if (root / name).exists()),
+            None,
+        )
         if image and label:
             return read_idx(image, 2051), read_idx(label, 2049)
-    raise FileNotFoundError("MNIST test IDX files were not found. Put t10k-images-idx3-ubyte and t10k-labels-idx1-ubyte under data/MNIST/raw/")
+    raise FileNotFoundError(
+        "MNIST test IDX files were not found. Put "
+        "t10k-images-idx3-ubyte and t10k-labels-idx1-ubyte "
+        "under data/MNIST/raw/")
 
 
 def mnist_data_status():
@@ -329,8 +482,12 @@ def mnist_data_status():
             counts[label] += 1
         return {"loaded": True, "samples": len(labels), "label_counts": counts,
                 "location": str(MNIST_DIR.relative_to(ROOT))}
-    except FileNotFoundError as error:
-        return {"loaded": False, "error": str(error), "location": str(MNIST_DIR.relative_to(ROOT))}
+    except (FileNotFoundError, OSError, ValueError) as error:
+        return {
+            "loaded": False,
+            "error": str(error),
+            "location": str(MNIST_DIR.relative_to(ROOT)),
+        }
 
 
 def download_mnist():
@@ -341,7 +498,9 @@ def download_mnist():
     for name in names:
         destination = MNIST_DIR / name
         if not destination.exists():
-            urllib.request.urlretrieve(base + name, destination)
+            partial = destination.with_suffix(destination.suffix + ".part")
+            urllib.request.urlretrieve(base + name, partial)
+            partial.replace(destination)
     return mnist_data_status()
 
 
@@ -354,7 +513,14 @@ def percentile(values, fraction):
     return values[lower] + (values[upper] - values[lower]) * (position - lower)
 
 
-def benchmark_runner(job_id, config, limit, batch_size, start_index=0, stride=1, shuffle_seed=None):
+def benchmark_runner(
+        job_id,
+        config,
+        limit,
+        batch_size,
+        start_index=0,
+        stride=1,
+        shuffle_seed=None):
     job = benchmark_jobs[job_id]
     try:
         images, labels = mnist_validation_set()
@@ -372,42 +538,145 @@ def benchmark_runner(job_id, config, limit, batch_size, start_index=0, stride=1,
             for index in range(begin, min(begin + batch_size, count)):
                 dataset_index = indices[index]
                 pixels = [value / 255.0 for value in images[dataset_index]]
-                result = execute({"pixels": pixels, "model": config.get("model", "relu"), "config": config})
-                if "error" in result: raise RuntimeError(result["error"])
-                prediction = max(range(10), key=lambda item: result["output"][item])
+                result = execute(
+                    {
+                        "pixels": pixels,
+                        "model": config.get("model", "relu"),
+                        "config": config,
+                    },
+                    collect_telemetry=False,
+                )
+                if "error" in result:
+                    raise RuntimeError(result["error"])
+                prediction = max(
+                    range(10),
+                    key=lambda item: result["output"][item],
+                )
                 label = labels[dataset_index]
-                correct += prediction == label
+                if prediction == label:
+                    correct += 1
                 latencies.append(result["execution_ms"])
                 setup_times.append(result.get("setup_ms", 0))
                 confusion[label][prediction] += 1
-                predictions.append({"index": dataset_index, "label": label, "prediction": prediction,
-                                    "latency_ms": result["execution_ms"], "setup_ms": result.get("setup_ms", 0)})
+                predictions.append({
+                    "index": dataset_index,
+                    "label": label,
+                    "prediction": prediction,
+                    "latency_ms": result["execution_ms"],
+                    "setup_ms": result.get("setup_ms", 0),
+                })
             done = min(begin + batch_size, count)
-            job.update({"completed": done, "accuracy": correct / done,
-                        "mean_latency_ms": sum(latencies) / len(latencies),
-                        "initialization_ms": sum(setup_times),
-                        "initialization_events": sum(1 for setup_ms in setup_times if setup_ms > 0),
-                        "progress": {"completed": done, "accuracy": correct / done, "mean_latency_ms": sum(latencies) / len(latencies)}})
+            mean_latency = sum(latencies) / len(latencies)
+            initialization_events = sum(
+                1 for setup_ms in setup_times if setup_ms > 0)
+            progress = {
+                "completed": done,
+                "accuracy": correct / done,
+                "mean_latency_ms": mean_latency,
+            }
+            job.update({
+                **progress,
+                "initialization_ms": sum(setup_times),
+                "initialization_events": initialization_events,
+                "progress": progress,
+            })
         elapsed = time.monotonic() - benchmark_started
         latency_sorted = sorted(latencies)
         label_totals = [sum(row) for row in confusion]
         mean_latency = sum(latencies) / len(latencies) if latencies else 0
-        latency_stddev = (sum((latency - mean_latency) ** 2 for latency in latencies) / len(latencies)) ** .5 if latencies else 0
-        summary = {"id": job_id, "created_at": job["created_at"], "finished_at": datetime.now(timezone.utc).isoformat(), "config": config, "samples": count, "batch_size": batch_size, "selection": {"start_index": start_index, "stride": stride, "shuffle_seed": shuffle_seed}, "accuracy": correct / count if count else 0, "correct": correct, "incorrect": count - correct, "mean_latency_ms": mean_latency, "min_latency_ms": latency_sorted[0] if latencies else 0, "max_latency_ms": latency_sorted[-1] if latencies else 0, "latency_stddev_ms": latency_stddev, "p50_latency_ms": percentile(latency_sorted, .50), "p95_latency_ms": percentile(latency_sorted, .95), "p99_latency_ms": percentile(latency_sorted, .99), "initialization_ms": sum(setup_times), "initialization_events": sum(1 for setup_ms in setup_times if setup_ms > 0), "throughput_per_s": count / elapsed if elapsed else 0, "confusion_matrix": confusion, "per_digit_accuracy": [confusion[d][d] / label_totals[d] if label_totals[d] else None for d in range(10)], "latency_ms": latencies, "setup_ms": setup_times, "predictions": predictions, "telemetry": usage_telemetry(power_before, telemetry_snapshot(), elapsed)}
+        if latencies:
+            variance = sum(
+                (latency - mean_latency) ** 2
+                for latency in latencies
+            ) / len(latencies)
+            latency_stddev = variance ** 0.5
+        else:
+            latency_stddev = 0
+        per_digit_accuracy = [
+            confusion[digit][digit] / label_totals[digit]
+            if label_totals[digit]
+            else None
+            for digit in range(10)
+        ]
+        initialization_events = sum(
+            1 for setup_ms in setup_times if setup_ms > 0)
+        summary = {
+            "id": job_id,
+            "created_at": job["created_at"],
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "config": config,
+            "samples": count,
+            "batch_size": batch_size,
+            "selection": {
+                "start_index": start_index,
+                "stride": stride,
+                "shuffle_seed": shuffle_seed,
+            },
+            "accuracy": correct / count if count else 0,
+            "correct": correct,
+            "incorrect": count - correct,
+            "mean_latency_ms": mean_latency,
+            "min_latency_ms": latency_sorted[0] if latencies else 0,
+            "max_latency_ms": latency_sorted[-1] if latencies else 0,
+            "latency_stddev_ms": latency_stddev,
+            "p50_latency_ms": percentile(latency_sorted, 0.50),
+            "p95_latency_ms": percentile(latency_sorted, 0.95),
+            "p99_latency_ms": percentile(latency_sorted, 0.99),
+            "initialization_ms": sum(setup_times),
+            "initialization_events": initialization_events,
+            "throughput_per_s": count / elapsed if elapsed else 0,
+            "confusion_matrix": confusion,
+            "per_digit_accuracy": per_digit_accuracy,
+            "latency_ms": latencies,
+            "setup_ms": setup_times,
+            "predictions": predictions,
+            "telemetry": usage_telemetry(
+                power_before, telemetry_snapshot(), elapsed),
+        }
         RESULTS_DIR.mkdir(exist_ok=True)
         destination = RESULTS_DIR / f"mnist-benchmark-{job_id}.json"
         destination.write_text(json.dumps(summary, indent=2))
-        job.update({"status": "complete", "result_file": str(destination.relative_to(ROOT)), **summary})
+        job.update({
+            "status": "complete",
+            "result_file": str(destination.relative_to(ROOT)),
+            **summary,
+        })
     except Exception as error:
         job.update({"status": "failed", "error": str(error)})
 
 
-def start_benchmark(config, limit, batch_size, start_index=0, stride=1, shuffle_seed=None):
+def start_benchmark(
+        config,
+        limit,
+        batch_size,
+        start_index=0,
+        stride=1,
+        shuffle_seed=None):
     if config.get("engine") not in ("he", "pytorch"):
         raise ValueError("choose an execution engine for the benchmark")
+    if limit < 0:
+        raise ValueError("benchmark limit cannot be negative")
     job_id = uuid.uuid4().hex[:12]
-    benchmark_jobs[job_id] = {"id": job_id, "status": "queued", "created_at": datetime.now(timezone.utc).isoformat(), "config": config}
-    threading.Thread(target=benchmark_runner, args=(job_id, config, limit, batch_size, start_index, stride, shuffle_seed), daemon=True).start()
+    benchmark_jobs[job_id] = {
+        "id": job_id,
+        "status": "queued",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "config": config,
+    }
+    arguments = (
+        job_id,
+        config,
+        limit,
+        batch_size,
+        start_index,
+        stride,
+        shuffle_seed,
+    )
+    threading.Thread(
+        target=benchmark_runner,
+        args=arguments,
+        daemon=True,
+    ).start()
     return benchmark_jobs[job_id]
 
 
@@ -422,8 +691,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/health":
-            self.send_json({"ok": HE_BINARY.exists(),
-                            "he_backends": {"cpu": HE_BINARY.exists(), "cuda": HE_BINARY.exists()}})
+            capabilities = he_capabilities()
+            self.send_json({
+                "ok": capabilities["cpu"],
+                "he_backends": capabilities,
+            })
             return
         if self.path == "/api/mnist/data":
             self.send_json(mnist_data_status())
@@ -450,15 +722,22 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
             if self.path == "/api/predict":
-                if len(request.get("pixels", [])) != 784:
-                    raise ValueError("pixels must contain 784 values")
                 self.send_json(execute(request))
             elif self.path == "/api/compare":
                 pixels = request.get("pixels", [])
-                if len(pixels) != 784:
-                    raise ValueError("pixels must contain 784 values")
-                left = execute({"pixels": pixels, "model": request.get("left", {}).get("model", "relu"), "config": request.get("left", {})})
-                right = execute({"pixels": pixels, "model": request.get("right", {}).get("model", "relu"), "config": request.get("right", {})})
+                validate_pixels(pixels)
+                left_config = request.get("left", {})
+                right_config = request.get("right", {})
+                left = execute({
+                    "pixels": pixels,
+                    "model": left_config.get("model", "relu"),
+                    "config": left_config,
+                })
+                right = execute({
+                    "pixels": pixels,
+                    "model": right_config.get("model", "relu"),
+                    "config": right_config,
+                })
                 self.send_json({"left": left, "right": right})
             elif self.path == "/api/benchmark":
                 config = request.get("config", {})
@@ -467,8 +746,19 @@ class Handler(BaseHTTPRequestHandler):
                 start_index = max(0, int(request.get("start_index", 0)))
                 stride = max(1, int(request.get("stride", 1)))
                 shuffle_seed = request.get("shuffle_seed")
-                shuffle_seed = int(shuffle_seed) if shuffle_seed not in (None, "") else None
-                self.send_json(start_benchmark(config, limit, batch_size, start_index, stride, shuffle_seed), 202)
+                if shuffle_seed in (None, ""):
+                    shuffle_seed = None
+                else:
+                    shuffle_seed = int(shuffle_seed)
+                job = start_benchmark(
+                    config,
+                    limit,
+                    batch_size,
+                    start_index,
+                    stride,
+                    shuffle_seed,
+                )
+                self.send_json(job, 202)
             elif self.path == "/api/mnist/download":
                 self.send_json(download_mnist())
             else:
@@ -480,10 +770,13 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-if not HE_BINARY.exists():
-    print("Build SEALTorch first: cmake -S . -B build && cmake --build build -j2", file=sys.stderr)
-    sys.exit(1)
-
 if __name__ == "__main__":
+    if not HE_BINARY.exists():
+        print(
+            "Build SEALTorch first: "
+            "cmake -S . -B build && cmake --build build -j2",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     print("SEALTorch WebUI: http://127.0.0.1:8080", flush=True)
     ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()

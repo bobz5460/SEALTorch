@@ -38,102 +38,89 @@ namespace sealtorch
         const seal::SEALContext& context,
         const seal::Evaluator& evaluator,
         const seal::GaloisKeys& galois_keys,
-        seal::CKKSEncoder& encoder,
         const seal::Ciphertext& input,
-        const std::vector<std::vector<double>>& weights,
-        std::size_t input_width,
-        std::size_t output_width,
-        double scale,
+        const EncodedMatrix& matrix,
         std::size_t thread_count,
-        ThreadPool &thread_pool,
-        const std::vector<seal::Plaintext> *cached_weights)
+        ThreadPool &thread_pool)
     {
-        // Use the actual number of CKKS slots for the wraparound. This is
-        // important when the layer is smaller than the ciphertext.
-        std::size_t size = encoder.slot_count();
-
-        // Only these rotations can contain a real input/output pair.
-        // This avoids rotating through every CKKS slot.
-        std::vector<bool> used(size, false);
-        for (std::size_t row = 0; row < output_width; ++row)
-        {
-            for (std::size_t column = 0; column < input_width; ++column)
+        // Baby-step/giant-step evaluates many diagonals while using only about
+        // 2*sqrt(slot_count) rotations. Rotation keys are much larger than
+        // plaintext weights, so this substantially reduces memory use.
+        std::vector<seal::Ciphertext> rotated_inputs(
+            matrix.input_rotations.size());
+        thread_pool.parallel_for_workers(
+            matrix.input_rotations.size(),
+            thread_count,
+            [&](std::size_t worker, std::size_t jobs)
             {
-                used[(column + size - row) % size] = true;
-            }
-        }
-
-        // Each diagonal is independent. Compute the terms in parallel, then
-        // add them together below in one thread.
-        std::vector<seal::Ciphertext> terms(size);
-        thread_pool.parallel_for_workers(size, thread_count, [&](std::size_t worker, std::size_t jobs) {
                 seal::Evaluator local_evaluator(context);
-                seal::CKKSEncoder local_encoder(context);
                 seal::MemoryPoolHandle pool = seal::MemoryPoolHandle::ThreadLocal();
-
-                std::size_t current = worker;
-                while (current < size)
+                for (std::size_t index = worker;
+                     index < matrix.input_rotations.size();
+                     index += jobs)
                 {
-                    if (used[current])
-                    {
-                        seal::Plaintext encoded;
-                        const seal::Plaintext *encoded_value = &encoded;
-                        if (cached_weights)
-                        {
-                            encoded_value = &(*cached_weights)[current];
-                        }
-                        else
-                        {
-                            std::vector<double> values(output_width, 0.0);
-                            for (std::size_t row = 0; row < output_width; ++row)
-                            {
-                                std::size_t column = (row + current) % size;
-                                if (column < input_width)
-                                    values[row] = weights[row][column];
-                            }
-                            local_encoder.encode(values, scale, encoded, pool);
-                        }
-
-                        seal::Ciphertext rotated;
-                        if (current == 0)
-                        {
-                            rotated = input;
-                        }
-                        else
-                        {
-                            local_evaluator.rotate_vector(
-                                input,
-                                static_cast<int>(current),
-                                galois_keys,
-                                rotated,
-                                pool);
-                        }
-
-                        if (!cached_weights)
-                            local_evaluator.mod_switch_to_inplace(encoded, rotated.parms_id());
-
-                        local_evaluator.multiply_plain(rotated, *encoded_value, terms[current], pool);
-                    }
-                    current += jobs;
+                    const int rotation = matrix.input_rotations[index];
+                    if (rotation == 0)
+                        rotated_inputs[index] = input;
+                    else
+                        local_evaluator.rotate_vector(
+                            input,
+                            rotation,
+                            galois_keys,
+                            rotated_inputs[index],
+                            pool);
                 }
             });
 
-        seal::Ciphertext result;
-        bool first = true;
-        for (std::size_t diagonal = 0; diagonal < size; ++diagonal)
-        {
-            if (!used[diagonal]) continue;
-            if (first)
+        std::vector<seal::Ciphertext> group_results(matrix.groups.size());
+        thread_pool.parallel_for_workers(
+            matrix.groups.size(),
+            thread_count,
+            [&](std::size_t worker, std::size_t jobs)
             {
-                result = std::move(terms[diagonal]);
-                first = false;
-            }
-            else
-            {
-                evaluator.add_inplace(result, terms[diagonal]);
-            }
-        }
+                seal::Evaluator local_evaluator(context);
+                seal::MemoryPoolHandle pool = seal::MemoryPoolHandle::ThreadLocal();
+                for (std::size_t group_index = worker;
+                     group_index < matrix.groups.size();
+                     group_index += jobs)
+                {
+                    const EncodedDiagonalGroup &group =
+                        matrix.groups[group_index];
+                    seal::Ciphertext subtotal;
+                    bool first = true;
+                    for (const EncodedDiagonal &diagonal : group.diagonals)
+                    {
+                        seal::Ciphertext term;
+                        local_evaluator.multiply_plain(
+                            rotated_inputs[diagonal.input_index],
+                            diagonal.weights,
+                            term,
+                            pool);
+                        if (first) {
+                            subtotal = std::move(term);
+                            first = false;
+                        } else {
+                            local_evaluator.add_inplace(subtotal, term);
+                        }
+                    }
 
+                    if (group.rotation == 0)
+                        group_results[group_index] = std::move(subtotal);
+                    else
+                        local_evaluator.rotate_vector(
+                            subtotal,
+                            group.rotation,
+                            galois_keys,
+                            group_results[group_index],
+                            pool);
+                }
+            });
+
+        seal::Ciphertext result = std::move(group_results.front());
+        for (std::size_t index = 1; index < group_results.size(); ++index)
+        {
+            evaluator.add_inplace(result, group_results[index]);
+        }
         return result;
     }
 
@@ -233,6 +220,44 @@ namespace sealtorch
         return approximate_polynomial(
             evaluator, relin_keys, encoder, input, scale,
             0.0, 0.5, 0.3989422804014327, -0.0664903800669054);
+    }
+
+    seal::Ciphertext approximate_tanh(
+        const seal::Evaluator& evaluator,
+        const seal::RelinKeys& relin_keys,
+        seal::CKKSEncoder& encoder,
+        const seal::Ciphertext& input,
+        double scale)
+    {
+        // Least-squares degree-three fit on [-8, 8]. The wider range avoids
+        // the sign flip a narrow local fit produces in LeNet's second block.
+        // It is deliberately shallow enough for practical CKKS evaluation.
+        seal::Ciphertext squared;
+        evaluator.square(input, squared);
+        evaluator.relinearize_inplace(squared, relin_keys);
+        evaluator.rescale_to_next_inplace(squared);
+        seal::Ciphertext result;
+        seal::Plaintext cubic_coefficient;
+        encoder.encode(-0.003956717265710641, scale, cubic_coefficient);
+        evaluator.mod_switch_to_inplace(cubic_coefficient, squared.parms_id());
+        evaluator.multiply_plain_inplace(squared, cubic_coefficient);
+        evaluator.rescale_to_next_inplace(squared);
+
+        seal::Ciphertext cubic_input = input;
+        evaluator.mod_switch_to_inplace(cubic_input, squared.parms_id());
+        evaluator.multiply(squared, cubic_input, result);
+        evaluator.relinearize_inplace(result, relin_keys);
+        evaluator.rescale_to_next_inplace(result);
+        seal::Plaintext linear_coefficient;
+        encoder.encode(0.3370407386009496, scale, linear_coefficient);
+        evaluator.mod_switch_to_inplace(linear_coefficient, input.parms_id());
+        seal::Ciphertext linear;
+        evaluator.multiply_plain(input, linear_coefficient, linear);
+        evaluator.rescale_to_next_inplace(linear);
+        evaluator.mod_switch_to_inplace(linear, result.parms_id());
+        linear.scale() = result.scale();
+        evaluator.add_inplace(result, linear);
+        return result;
     }
 
 }

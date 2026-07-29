@@ -23,7 +23,8 @@ namespace sealtorch
             total += error;
             if (error > tolerance) ++result.different_values;
         }
-        result.mean_absolute_error = total / expected.size();
+        result.mean_absolute_error =
+            total / static_cast<double>(expected.size());
         return result;
     }
 }
