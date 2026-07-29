@@ -150,16 +150,49 @@ def gpu_power_watts():
         return None
 
 
-def cpu_energy_uj():
-    paths = list(pathlib.Path("/sys/class/powercap").rglob("energy_uj"))
+def cpu_energy_snapshot():
+    """Return CPU *package* RAPL counters, without double-counting subdomains.
+
+    A RAPL package directory may also contain DRAM/core subdomains.  Summing all
+    ``energy_uj`` files counts the same work more than once, so select only
+    domains named ``package-*``.  Some container hosts expose the files but do
+    not grant read access; preserve that useful distinction for the UI.
+    """
+    roots = (pathlib.Path("/sys/class/powercap"),
+             pathlib.Path("/sys/devices/virtual/powercap"))
+    packages, seen, unreadable = [], set(), False
+    for root in roots:
+        if not root.exists():
+            continue
+        for energy_path in root.rglob("energy_uj"):
+            directory = energy_path.parent
+            try:
+                resolved = str(directory.resolve())
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                if not directory.joinpath("name").read_text().strip().lower().startswith("package-"):
+                    continue
+                packages.append({"path": energy_path,
+                                 "max_path": directory / "max_energy_range_uj"})
+            except OSError:
+                unreadable = True
+    if not packages:
+        return {"counters": None,
+                "reason": "No CPU package RAPL counters are exposed by this host"}
+    counters = []
     try:
-        return sum(int(path.read_text().strip()) for path in paths) or None
+        for package in packages:
+            counters.append({"energy_uj": int(package["path"].read_text().strip()),
+                             "max_energy_uj": int(package["max_path"].read_text().strip())})
     except (OSError, ValueError):
-        return None
+        return {"counters": None,
+                "reason": "CPU package RAPL counters are present but not readable by this server"}
+    return {"counters": counters, "reason": None}
 
 
 def telemetry_snapshot():
-    return {"gpu_power_w": gpu_power_watts(), "cpu_energy_uj": cpu_energy_uj()}
+    return {"gpu_power_w": gpu_power_watts(), "cpu": cpu_energy_snapshot()}
 
 
 def usage_telemetry(before, after, elapsed_seconds):
@@ -168,11 +201,25 @@ def usage_telemetry(before, after, elapsed_seconds):
     if before["gpu_power_w"] is not None and after["gpu_power_w"] is not None:
         gpu_power = (before["gpu_power_w"] + after["gpu_power_w"]) / 2
     cpu_energy = None
-    if before["cpu_energy_uj"] is not None and after["cpu_energy_uj"] is not None:
-        # RAPL counters are monotonically increasing in normal benchmark windows.
-        delta = after["cpu_energy_uj"] - before["cpu_energy_uj"]
-        if delta >= 0:
-            cpu_energy = delta / 1_000_000
+    cpu_reason = after["cpu"]["reason"] or before["cpu"]["reason"]
+    before_counters, after_counters = before["cpu"]["counters"], after["cpu"]["counters"]
+    if before_counters is not None and after_counters is not None:
+        if len(before_counters) != len(after_counters):
+            cpu_reason = "CPU package counter set changed while measuring"
+        else:
+            # RAPL counters wrap at max_energy_range_uj. Correct wrapping is
+            # essential for long benchmarks, and avoids dropping valid energy.
+            deltas = []
+            for start, end in zip(before_counters, after_counters):
+                delta = end["energy_uj"] - start["energy_uj"]
+                if delta < 0:
+                    delta += end["max_energy_uj"]
+                if delta < 0:
+                    cpu_reason = "CPU package counter reset while measuring"
+                    break
+                deltas.append(delta)
+            else:
+                cpu_energy = sum(deltas) / 1_000_000
     gpu_energy = gpu_power * elapsed_seconds if gpu_power is not None else None
     known_energy = [value for value in (cpu_energy, gpu_energy) if value is not None]
     return {
@@ -185,7 +232,9 @@ def usage_telemetry(before, after, elapsed_seconds):
                           if gpu_power is not None or cpu_energy is not None else None),
         "wall_ms": elapsed_seconds * 1000,
         "gpu_energy_method": "two-point power estimate" if gpu_energy is not None else None,
-        "cpu_energy_method": "Intel/AMD RAPL package counter" if cpu_energy is not None else None,
+        "cpu_energy_method": "RAPL CPU package counters" if cpu_energy is not None else None,
+        "cpu_power_reason": cpu_reason,
+        "gpu_power_reason": "NVIDIA power sensor is unavailable" if gpu_power is None else None,
     }
 
 
@@ -270,6 +319,15 @@ def download_mnist():
     return mnist_data_status()
 
 
+def percentile(values, fraction):
+    """Linearly interpolated percentile for a pre-sorted, non-empty sequence."""
+    if not values:
+        return 0
+    position = (len(values) - 1) * fraction
+    lower, upper = int(position), min(int(position) + 1, len(values) - 1)
+    return values[lower] + (values[upper] - values[lower]) * (position - lower)
+
+
 def benchmark_runner(job_id, config, limit, batch_size, start_index=0, stride=1, shuffle_seed=None):
     job = benchmark_jobs[job_id]
     try:
@@ -307,7 +365,9 @@ def benchmark_runner(job_id, config, limit, batch_size, start_index=0, stride=1,
         elapsed = time.monotonic() - benchmark_started
         latency_sorted = sorted(latencies)
         label_totals = [sum(row) for row in confusion]
-        summary = {"id": job_id, "created_at": job["created_at"], "finished_at": datetime.now(timezone.utc).isoformat(), "config": config, "samples": count, "batch_size": batch_size, "selection": {"start_index": start_index, "stride": stride, "shuffle_seed": shuffle_seed}, "accuracy": correct / count if count else 0, "mean_latency_ms": sum(latencies) / len(latencies) if latencies else 0, "p50_latency_ms": latency_sorted[len(latency_sorted)//2] if latencies else 0, "p95_latency_ms": latency_sorted[min(len(latencies)-1, int(len(latencies)*.95))] if latencies else 0, "initialization_ms": sum(setup_times), "initialization_events": sum(1 for setup_ms in setup_times if setup_ms > 0), "throughput_per_s": count / elapsed if elapsed else 0, "confusion_matrix": confusion, "per_digit_accuracy": [confusion[d][d] / label_totals[d] if label_totals[d] else None for d in range(10)], "latency_ms": latencies, "setup_ms": setup_times, "predictions": predictions, "telemetry": usage_telemetry(power_before, telemetry_snapshot(), elapsed)}
+        mean_latency = sum(latencies) / len(latencies) if latencies else 0
+        latency_stddev = (sum((latency - mean_latency) ** 2 for latency in latencies) / len(latencies)) ** .5 if latencies else 0
+        summary = {"id": job_id, "created_at": job["created_at"], "finished_at": datetime.now(timezone.utc).isoformat(), "config": config, "samples": count, "batch_size": batch_size, "selection": {"start_index": start_index, "stride": stride, "shuffle_seed": shuffle_seed}, "accuracy": correct / count if count else 0, "correct": correct, "incorrect": count - correct, "mean_latency_ms": mean_latency, "min_latency_ms": latency_sorted[0] if latencies else 0, "max_latency_ms": latency_sorted[-1] if latencies else 0, "latency_stddev_ms": latency_stddev, "p50_latency_ms": percentile(latency_sorted, .50), "p95_latency_ms": percentile(latency_sorted, .95), "p99_latency_ms": percentile(latency_sorted, .99), "initialization_ms": sum(setup_times), "initialization_events": sum(1 for setup_ms in setup_times if setup_ms > 0), "throughput_per_s": count / elapsed if elapsed else 0, "confusion_matrix": confusion, "per_digit_accuracy": [confusion[d][d] / label_totals[d] if label_totals[d] else None for d in range(10)], "latency_ms": latencies, "setup_ms": setup_times, "predictions": predictions, "telemetry": usage_telemetry(power_before, telemetry_snapshot(), elapsed)}
         RESULTS_DIR.mkdir(exist_ok=True)
         destination = RESULTS_DIR / f"mnist-benchmark-{job_id}.json"
         destination.write_text(json.dumps(summary, indent=2))
