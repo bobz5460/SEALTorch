@@ -24,17 +24,17 @@ namespace sealtorch
             switch (operation.kind)
             {
             case OperationKind::Linear:
-                values = linear(values, std::any_cast<const DenseLayer &>(operation.payload),
+                values = linear(values, operation.linear_layer,
                                 dense_index++, evaluator, config);
                 break;
             case OperationKind::Activation:
-                values = activation(values, std::any_cast<ActivationType>(operation.payload), evaluator, config);
+                values = activation(values, operation.activation_type, evaluator, config);
                 break;
             case OperationKind::Convolution2D:
-                values = convolution2d(values, std::any_cast<const Convolution2D &>(operation.payload), evaluator, config);
+                values = convolution2d(values, operation.convolution_layer, evaluator, config);
                 break;
             case OperationKind::Pooling2D:
-                values = pool2d(values, std::any_cast<const Pooling2D &>(operation.payload), evaluator, config);
+                values = pool2d(values, operation.pooling_layer, evaluator, config);
                 break;
             case OperationKind::Flatten:
                 // Flatten changes interpretation, not ciphertext contents.

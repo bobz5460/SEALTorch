@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <any>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -57,41 +56,75 @@ namespace sealtorch
     {
         OperationKind kind = OperationKind::Flatten;
         std::string name = "Flatten";
-        std::any payload;
         TensorShape input_shape;
         TensorShape output_shape;
 
+        // An operation uses the field that matches its kind.
+        DenseLayer linear_layer;
+        ActivationType activation_type = ActivationType::Relu;
+        Convolution2D convolution_layer;
+        Pooling2D pooling_layer;
+
         static Operation linear(DenseLayer layer, TensorShape input = {}, TensorShape output = {})
         {
-            return {OperationKind::Linear, "Linear", std::move(layer), std::move(input), std::move(output)};
+            Operation operation;
+            operation.kind = OperationKind::Linear;
+            operation.name = "Linear";
+            operation.linear_layer = std::move(layer);
+            operation.input_shape = std::move(input);
+            operation.output_shape = std::move(output);
+            return operation;
         }
 
         static Operation activation(ActivationType type)
         {
-            return {OperationKind::Activation, "Activation", type, {}, {}};
+            Operation operation;
+            operation.kind = OperationKind::Activation;
+            operation.name = "Activation";
+            operation.activation_type = type;
+            return operation;
         }
 
         static Operation convolution2d(Convolution2D layer, TensorShape input = {}, TensorShape output = {})
         {
-            return {OperationKind::Convolution2D, "Convolution2D", std::move(layer), std::move(input), std::move(output)};
+            Operation operation;
+            operation.kind = OperationKind::Convolution2D;
+            operation.name = "Convolution2D";
+            operation.convolution_layer = std::move(layer);
+            operation.input_shape = std::move(input);
+            operation.output_shape = std::move(output);
+            return operation;
         }
 
         static Operation pooling2d(Pooling2D layer, TensorShape input = {}, TensorShape output = {})
         {
-            return {OperationKind::Pooling2D, "Pooling2D", std::move(layer), std::move(input), std::move(output)};
+            Operation operation;
+            operation.kind = OperationKind::Pooling2D;
+            operation.name = "Pooling2D";
+            operation.pooling_layer = std::move(layer);
+            operation.input_shape = std::move(input);
+            operation.output_shape = std::move(output);
+            return operation;
         }
 
         static Operation flatten(TensorShape input = {}, TensorShape output = {})
         {
-            return {OperationKind::Flatten, "Flatten", {}, std::move(input), std::move(output)};
+            Operation operation;
+            operation.kind = OperationKind::Flatten;
+            operation.name = "Flatten";
+            operation.input_shape = std::move(input);
+            operation.output_shape = std::move(output);
+            return operation;
         }
 
-        template <typename Payload>
-        static Operation custom(std::string operation_name, Payload payload,
-                                TensorShape input = {}, TensorShape output = {})
+        static Operation custom(std::string operation_name, TensorShape input = {}, TensorShape output = {})
         {
-            return {OperationKind::Custom, std::move(operation_name),
-                    std::any(std::move(payload)), std::move(input), std::move(output)};
+            Operation operation;
+            operation.kind = OperationKind::Custom;
+            operation.name = std::move(operation_name);
+            operation.input_shape = std::move(input);
+            operation.output_shape = std::move(output);
+            return operation;
         }
     };
 
@@ -147,10 +180,11 @@ namespace sealtorch
             DenseLayer dense = layer.parameters();
             TensorShape input = {static_cast<std::size_t>(dense.input_size)};
             TensorShape output = {static_cast<std::size_t>(dense.output_size)};
-            for (auto reverse = operations_.rbegin(); reverse != operations_.rend(); ++reverse)
+            for (std::size_t index = operations_.size(); index > 0; --index)
             {
-                if (reverse->kind != OperationKind::Linear) continue;
-                const auto &previous = std::any_cast<const DenseLayer &>(reverse->payload);
+                const Operation &previous_operation = operations_[index - 1];
+                if (previous_operation.kind != OperationKind::Linear) continue;
+                const DenseLayer &previous = previous_operation.linear_layer;
                 if (previous.output_size != dense.input_size)
                     throw std::runtime_error("linear layer sizes do not match");
                 break;
@@ -175,7 +209,7 @@ namespace sealtorch
                 dense_cache_.clear();
                 for (const Operation &operation : operations_)
                     if (operation.kind == OperationKind::Linear)
-                        dense_cache_.push_back(std::any_cast<const DenseLayer &>(operation.payload));
+                        dense_cache_.push_back(operation.linear_layer);
                     else if (operation.kind != OperationKind::Activation)
                         throw std::runtime_error("layers() is only available for dense models");
                 dense_cache_valid_ = true;
@@ -196,7 +230,7 @@ namespace sealtorch
         ActivationType activation(std::size_t index) const
         {
             if (!has_activation(index)) throw std::runtime_error("operation has no activation");
-            return std::any_cast<ActivationType>(operations_[linear_operation_index(index) + 1].payload);
+            return operations_[linear_operation_index(index) + 1].activation_type;
         }
 
     private:
@@ -204,12 +238,12 @@ namespace sealtorch
         {
             if (operation.kind == OperationKind::Linear)
             {
-                const auto &layer = std::any_cast<const DenseLayer &>(operation.payload);
+                const DenseLayer &layer = operation.linear_layer;
                 if (layer.input_size < 0 || layer.output_size < 0 ||
                     layer.weights.size() != static_cast<std::size_t>(layer.output_size) ||
                     layer.biases.size() != static_cast<std::size_t>(layer.output_size))
                     throw std::runtime_error("invalid dense layer dimensions");
-                for (const auto &row : layer.weights)
+                for (const std::vector<double> &row : layer.weights)
                     if (row.size() != static_cast<std::size_t>(layer.input_size))
                         throw std::runtime_error("invalid dense layer weight dimensions");
             }
@@ -219,18 +253,19 @@ namespace sealtorch
         {
             if (!input)
             {
-                for (auto reverse = operations_.rbegin(); reverse != operations_.rend(); ++reverse)
+                for (std::size_t index = operations_.size(); index > 0; --index)
                 {
-                    if (reverse->kind == OperationKind::Linear)
-                        return std::any_cast<const DenseLayer &>(reverse->payload).output_size;
-                    if (!reverse->output_shape.empty()) return shape_size(reverse->output_shape);
+                    const Operation &operation = operations_[index - 1];
+                    if (operation.kind == OperationKind::Linear)
+                        return operation.linear_layer.output_size;
+                    if (!operation.output_shape.empty()) return shape_size(operation.output_shape);
                 }
                 return 0;
             }
             for (const Operation &operation : operations_)
             {
                 if (operation.kind == OperationKind::Linear)
-                    return std::any_cast<const DenseLayer &>(operation.payload).input_size;
+                    return operation.linear_layer.input_size;
                 if (!operation.input_shape.empty()) return shape_size(operation.input_shape);
             }
             return 0;
