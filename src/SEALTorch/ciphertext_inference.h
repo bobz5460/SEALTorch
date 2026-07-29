@@ -35,8 +35,18 @@ namespace sealtorch
         double encrypt_ms = 0.0;
         double evaluate_ms = 0.0;
         double decrypt_ms = 0.0;
+        // Exact bytes emitted by the provider's native serialization format.
+        // This is the relevant size for storage or transport.
         std::size_t input_ciphertext_bytes = 0;
         std::size_t output_ciphertext_bytes = 0;
+        // Uncompressed coefficient buffers currently occupied by ciphertexts.
+        std::size_t input_ciphertext_memory_bytes = 0;
+        std::size_t output_ciphertext_memory_bytes = 0;
+        // Serialized context key material. These are setup costs, not bytes
+        // transferred for an individual prediction.
+        std::size_t secret_key_bytes = 0;
+        std::size_t relin_keys_bytes = 0;
+        std::size_t galois_keys_bytes = 0;
     };
 
     // One encrypt -> evaluate -> decrypt API for Microsoft SEAL (CPU) and

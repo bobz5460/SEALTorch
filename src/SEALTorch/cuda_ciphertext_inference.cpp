@@ -3,6 +3,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
@@ -165,25 +166,38 @@ namespace sealtorch::cuda
 
         std::size_t slot_count() const { return options.ring_dimension / 2; }
 
-        std::vector<double> predict(const std::vector<double> &input)
+        CiphertextInferenceResult predict(const std::vector<double> &input)
         {
             if (input.size() != static_cast<std::size_t>(layers.front().parameters.input_size))
                 throw std::runtime_error("input size does not match the model");
 
+            CiphertextInferenceResult result;
+            const auto encrypt_start = std::chrono::steady_clock::now();
             Plaintext plain = context->MakeCKKSPackedPlaintext(input);
             Ciphertext encrypted = context->Encrypt(keys.secretKey, plain);
+            cudaDeviceSynchronize();
+            const auto encrypt_end = std::chrono::steady_clock::now();
+            const auto evaluate_start = encrypt_end;
             for (PackedLayer &layer : layers)
             {
                 encrypted = linear(context, encrypted, layer);
                 if (layer.has_activation)
                     encrypted = activate(context, encrypted, layer.activation, slot_count());
             }
+            cudaDeviceSynchronize();
+            const auto evaluate_end = std::chrono::steady_clock::now();
 
+            const auto decrypt_start = evaluate_end;
             Plaintext decoded;
             context->Decrypt(encrypted, keys.secretKey, &decoded);
-            std::vector<double> output = decoded->GetRealPackedValue();
-            output.resize(static_cast<std::size_t>(layers.back().parameters.output_size));
-            return output;
+            cudaDeviceSynchronize();
+            result.values = decoded->GetRealPackedValue();
+            result.values.resize(static_cast<std::size_t>(layers.back().parameters.output_size));
+            const auto decrypt_end = std::chrono::steady_clock::now();
+            result.encrypt_ms = std::chrono::duration<double, std::milli>(encrypt_end - encrypt_start).count();
+            result.evaluate_ms = std::chrono::duration<double, std::milli>(evaluate_end - evaluate_start).count();
+            result.decrypt_ms = std::chrono::duration<double, std::milli>(decrypt_end - decrypt_start).count();
+            return result;
         }
     };
 
@@ -192,6 +206,6 @@ namespace sealtorch::cuda
     CiphertextInferenceEngine::~CiphertextInferenceEngine() = default;
     CiphertextInferenceEngine::CiphertextInferenceEngine(CiphertextInferenceEngine &&) noexcept = default;
     CiphertextInferenceEngine &CiphertextInferenceEngine::operator=(CiphertextInferenceEngine &&) noexcept = default;
-    std::vector<double> CiphertextInferenceEngine::predict(const std::vector<double> &input) { return implementation_->predict(input); }
+    CiphertextInferenceResult CiphertextInferenceEngine::predict(const std::vector<double> &input) { return implementation_->predict(input); }
     std::size_t CiphertextInferenceEngine::slot_count() const { return implementation_->slot_count(); }
 }

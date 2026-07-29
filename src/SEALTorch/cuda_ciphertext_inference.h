@@ -24,6 +24,14 @@ namespace sealtorch::cuda
         int device = 0;
     };
 
+    struct CiphertextInferenceResult
+    {
+        std::vector<double> values;
+        double encrypt_ms = 0.0;
+        double evaluate_ms = 0.0;
+        double decrypt_ms = 0.0;
+    };
+
     // Packed ciphertext inference backed directly by FIDESlib. The engine
     // owns its context, keys, and cached model plaintexts; callers only pass
     // ordinary doubles in and receive ordinary doubles out.
@@ -37,7 +45,7 @@ namespace sealtorch::cuda
         CiphertextInferenceEngine(const CiphertextInferenceEngine &) = delete;
         CiphertextInferenceEngine &operator=(const CiphertextInferenceEngine &) = delete;
 
-        std::vector<double> predict(const std::vector<double> &input);
+        CiphertextInferenceResult predict(const std::vector<double> &input);
         std::size_t slot_count() const;
 
     private:

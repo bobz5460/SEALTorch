@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -107,7 +108,7 @@ static sealtorch::CiphertextInferenceOptions ciphertext_inference_options(const 
         static_cast<std::size_t>(config.scale_bits)};
 }
 
-static double memory_mb() { std::ifstream file("/proc/self/status"); std::string line; while (std::getline(file, line)) if (line.rfind("VmRSS:", 0) == 0) { std::istringstream values(line.substr(6)); double kilobytes = 0; values >> kilobytes; return kilobytes / 1024.0; } return 0; }
+static std::size_t resident_memory_bytes() { std::ifstream file("/proc/self/statm"); std::size_t total_pages = 0, resident_pages = 0; if (!(file >> total_pages >> resident_pages)) return 0; const long page_size = sysconf(_SC_PAGESIZE); return page_size > 0 ? resident_pages * static_cast<std::size_t>(page_size) : 0; }
 static void print_numbers(const std::vector<double> &values) { std::cout << '['; for (std::size_t i = 0; i < values.size(); ++i) { if (i) std::cout << ','; std::cout << std::setprecision(12) << values[i]; } std::cout << ']'; }
 static const std::string &model_path(const json::Value &request) { static const std::string relu = "src/mnist_mlp.json", gelu = "src/mnist_mlp_gelu.json"; const std::string selected = request.has("model") ? request.at("model").string : "relu"; if (selected == "relu") return relu; if (selected == "gelu") return gelu; throw std::runtime_error("model must be relu or gelu"); }
 
@@ -128,10 +129,11 @@ static int run_web_worker() {
             active_model = selected_model;
             setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count();
         }
-        const double memory_before = memory_mb();
+        const std::size_t memory_before = resident_memory_bytes();
         const sealtorch::CiphertextInferenceResult encrypted = ciphertext_inference->predict(input);
         const bool use_cuda = ciphertext_inference->target() == sealtorch::ExecutionTarget::Cuda;
-        std::cout << "{\"encrypted\":"; print_numbers(encrypted.values); std::cout << ",\"setup_ms\":" << setup_ms << ",\"encrypt_ms\":" << encrypted.encrypt_ms << ",\"evaluate_ms\":" << encrypted.evaluate_ms << ",\"decrypt_ms\":" << encrypted.decrypt_ms << ",\"encrypted_ms\":" << encrypted.encrypt_ms + encrypted.evaluate_ms + encrypted.decrypt_ms << ",\"memory_before_mb\":" << memory_before << ",\"memory_after_mb\":" << memory_mb() << ",\"input_ciphertext_bytes\":" << encrypted.input_ciphertext_bytes << ",\"output_ciphertext_bytes\":" << encrypted.output_ciphertext_bytes << ",\"backend\":\"" << (config.packed ? "packed" : "scalar") << "\",\"device\":\"" << (use_cuda ? "cuda" : "cpu") << "\"}\n";
+        const std::size_t memory_after = resident_memory_bytes();
+        std::cout << "{\"encrypted\":"; print_numbers(encrypted.values); std::cout << ",\"setup_ms\":" << setup_ms << ",\"encrypt_ms\":" << encrypted.encrypt_ms << ",\"evaluate_ms\":" << encrypted.evaluate_ms << ",\"decrypt_ms\":" << encrypted.decrypt_ms << ",\"encrypted_ms\":" << encrypted.encrypt_ms + encrypted.evaluate_ms + encrypted.decrypt_ms << ",\"memory_before_bytes\":" << memory_before << ",\"memory_after_bytes\":" << memory_after << ",\"memory_delta_bytes\":" << static_cast<long long>(memory_after) - static_cast<long long>(memory_before) << ",\"input_ciphertext_bytes\":" << encrypted.input_ciphertext_bytes << ",\"output_ciphertext_bytes\":" << encrypted.output_ciphertext_bytes << ",\"input_ciphertext_memory_bytes\":" << encrypted.input_ciphertext_memory_bytes << ",\"output_ciphertext_memory_bytes\":" << encrypted.output_ciphertext_memory_bytes << ",\"secret_key_bytes\":" << encrypted.secret_key_bytes << ",\"relin_keys_bytes\":" << encrypted.relin_keys_bytes << ",\"galois_keys_bytes\":" << encrypted.galois_keys_bytes << ",\"backend\":\"" << (config.packed ? "packed" : "scalar") << "\",\"device\":\"" << (use_cuda ? "cuda" : "cpu") << "\"}\n";
     } catch (const std::exception &error) { std::cout << "{\"error\":\"" << error.what() << "\"}\n"; }
     std::cout.flush();
     return 0;

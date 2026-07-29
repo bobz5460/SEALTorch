@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -14,12 +15,20 @@ namespace sealtorch
 {
     namespace
     {
-        std::size_t ciphertext_bytes(const CiphertextInferenceOptions &options)
+        template <class Serializable>
+        std::size_t serialized_bytes(const Serializable &value)
         {
-            // A provider-neutral coefficient-storage estimate. Native
-            // serialized ciphertexts differ, so reporting one common metric
-            // makes CPU/CUDA experiment results comparable.
-            return 2 * options.ring_dimension * (options.multiplicative_depth + 1) * sizeof(std::uint64_t);
+            std::ostringstream stream(std::ios::out | std::ios::binary);
+            value.save(stream);
+            return stream.tellp() < 0 ? 0 : static_cast<std::size_t>(stream.tellp());
+        }
+
+        std::size_t ciphertext_memory_bytes(const seal::Ciphertext &value, const seal::SEALContext &context)
+        {
+            const auto context_data = context.get_context_data(value.parms_id());
+            if (!context_data) return 0;
+            return value.size() * context_data->parms().poly_modulus_degree() *
+                context_data->parms().coeff_modulus().size() * sizeof(std::uint64_t);
         }
 
         seal::SEALContext make_cpu_context(const CiphertextInferenceOptions &options)
@@ -56,6 +65,9 @@ namespace sealtorch
                 std::sort(rotations.begin(), rotations.end());
                 rotations.erase(std::unique(rotations.begin(), rotations.end()), rotations.end());
                 keys_.create_galois_keys(rotations, galois_keys_);
+                secret_key_bytes_ = serialized_bytes(keys_.secret_key());
+                relin_keys_bytes_ = serialized_bytes(relin_keys_);
+                galois_keys_bytes_ = serialized_bytes(galois_keys_);
             }
 
             CiphertextInferenceResult predict(const std::vector<double> &input)
@@ -66,7 +78,11 @@ namespace sealtorch
                 encoder_.encode(input, scale_, plain);
                 seal::Ciphertext encrypted;
                 encryptor_.encrypt_symmetric(plain, encrypted);
-                result.input_ciphertext_bytes = ciphertext_bytes(options_);
+                result.input_ciphertext_bytes = serialized_bytes(encrypted);
+                result.input_ciphertext_memory_bytes = ciphertext_memory_bytes(encrypted, context_);
+                result.secret_key_bytes = secret_key_bytes_;
+                result.relin_keys_bytes = relin_keys_bytes_;
+                result.galois_keys_bytes = galois_keys_bytes_;
                 const auto encrypt_end = std::chrono::steady_clock::now();
 
                 const SealCiphertextBackend &backend = options_.layout == CiphertextLayout::Packed
@@ -86,7 +102,8 @@ namespace sealtorch
                     seal::Plaintext decoded;
                     decryptor.decrypt(output.front(), decoded);
                     encoder_.decode(decoded, result.values);
-                    result.output_ciphertext_bytes = ciphertext_bytes(options_);
+                    result.output_ciphertext_bytes = serialized_bytes(output.front());
+                    result.output_ciphertext_memory_bytes = ciphertext_memory_bytes(output.front(), context_);
                 }
                 else for (const seal::Ciphertext &source : output)
                 {
@@ -95,7 +112,8 @@ namespace sealtorch
                     decryptor.decrypt(source, decoded);
                     encoder_.decode(decoded, values);
                     result.values.push_back(values.front());
-                    result.output_ciphertext_bytes += ciphertext_bytes(options_);
+                    result.output_ciphertext_bytes += serialized_bytes(source);
+                    result.output_ciphertext_memory_bytes += ciphertext_memory_bytes(source, context_);
                 }
                 result.values.resize(static_cast<std::size_t>(model_.model().output_size()));
                 const auto decrypt_end = std::chrono::steady_clock::now();
@@ -118,6 +136,9 @@ namespace sealtorch
             SealPackedBackend packed_backend_;
             SealCiphertextModel model_;
             double scale_;
+            std::size_t secret_key_bytes_ = 0;
+            std::size_t relin_keys_bytes_ = 0;
+            std::size_t galois_keys_bytes_ = 0;
         };
     }
 
@@ -151,12 +172,15 @@ namespace sealtorch
         CiphertextInferenceResult predict(const std::vector<double> &input)
         {
             if (cpu_inference) return cpu_inference->predict(input);
-            const auto started = std::chrono::steady_clock::now();
             CiphertextInferenceResult result;
-            result.values = cuda_engine->predict(input);
-            result.evaluate_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-            result.input_ciphertext_bytes = ciphertext_bytes(options);
-            result.output_ciphertext_bytes = ciphertext_bytes(options);
+            const cuda::CiphertextInferenceResult cuda_result = cuda_engine->predict(input);
+            result.values = cuda_result.values;
+            result.encrypt_ms = cuda_result.encrypt_ms;
+            result.evaluate_ms = cuda_result.evaluate_ms;
+            result.decrypt_ms = cuda_result.decrypt_ms;
+            // FIDESlib keeps ciphertexts opaque, so exposing a SEAL-derived
+            // estimate here would be inaccurate. A value of zero means the
+            // provider does not currently expose this measurement.
             return result;
         }
     };
