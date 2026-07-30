@@ -157,6 +157,7 @@ private:
 struct ModelArtifact {
     sealtorch::Sequential encrypted;
     bool cnn = false;
+    std::size_t minimum_ring_dimension = 0;
 };
 
 static void flatten_tensor(const json::Value &value, std::vector<double> &output) {
@@ -172,31 +173,43 @@ static int checked_size(std::size_t value, const std::string &name)
     return static_cast<int>(value);
 }
 
-static sealtorch::DenseLayer read_dense(const std::map<std::string, json::Value> &tensors, const std::string &prefix) {
-    const auto &weight_rows = tensors.at(prefix + ".weight").at("data").array;
-    const auto &bias_values = tensors.at(prefix + ".bias").at("data").array;
-    if (weight_rows.empty() || bias_values.size() != weight_rows.size())
-        throw std::runtime_error("invalid dense tensor: " + prefix);
-    const std::size_t input_size = weight_rows.front().array.size();
-    if (input_size == 0)
-        throw std::runtime_error("dense tensor has no inputs: " + prefix);
-    for (const json::Value &row : weight_rows) {
-        if (row.array.size() != input_size)
-            throw std::runtime_error("dense tensor rows do not match: " + prefix);
-    }
-    sealtorch::DenseLayer layer{
-        checked_size(input_size, "dense input"),
-        checked_size(weight_rows.size(), "dense output"),
-        {},
-        {},
-    };
-    layer.weights.resize(weight_rows.size());
-    layer.biases.resize(bias_values.size());
-    for (std::size_t row = 0; row < weight_rows.size(); ++row) {
-        for (const auto &weight : weight_rows[row].array) layer.weights[row].push_back(weight.number);
-        layer.biases[row] = bias_values[row].number;
-    }
-    return layer;
+static std::vector<double> read_tensor(const std::map<std::string, json::Value> &tensors,
+    const std::string &key) {
+    std::vector<double> result;
+    const json::Value &value = tensors.at(key);
+    flatten_tensor(value.has("data") ? value.at("data") : value, result);
+    return result;
+}
+
+static std::size_t positive_size(const json::Value &value, const std::string &field) {
+    if (value.kind != json::Value::Kind::number || value.number <= 0 ||
+        std::floor(value.number) != value.number)
+        throw std::runtime_error("invalid " + field);
+    return static_cast<std::size_t>(value.number);
+}
+
+static std::size_t pair_value(const json::Value &layer, const std::string &field) {
+    const json::Value &value = layer.at(field);
+    if (value.kind == json::Value::Kind::number) return positive_size(value, field);
+    if (value.kind != json::Value::Kind::array || value.array.size() != 2 ||
+        positive_size(value.array[0], field) != positive_size(value.array[1], field))
+        throw std::runtime_error(field + " must be a square positive pair");
+    return positive_size(value.array[0], field);
+}
+
+static bool zero_pair(const json::Value &layer, const std::string &field) {
+    const json::Value &value = layer.at(field);
+    if (value.kind == json::Value::Kind::number) return value.number == 0;
+    return value.kind == json::Value::Kind::array && value.array.size() == 2 &&
+        value.array[0].kind == json::Value::Kind::number && value.array[0].number == 0 &&
+        value.array[1].kind == json::Value::Kind::number && value.array[1].number == 0;
+}
+
+static sealtorch::Activation activation_for(const std::string &op) {
+    if (op == "relu") return sealtorch::Activation::relu();
+    if (op == "gelu") return sealtorch::Activation::gelu();
+    if (op == "tanh") return sealtorch::Activation::tanh();
+    throw std::runtime_error("encrypted inference does not yet approximate trainer activation: " + op);
 }
 
 static std::size_t image_index(std::size_t channel, std::size_t row, std::size_t column,
@@ -282,44 +295,67 @@ static sealtorch::DenseLayer lower_average_pool(std::size_t channels, std::size_
 static ModelArtifact load_model(const std::string &path) {
     std::ifstream file(path); if (!file) throw std::runtime_error("cannot open model: " + path);
     std::stringstream contents; contents << file.rdbuf(); const auto root = json::Parser(contents.str()).parse();
-    const auto &tensors = root.at("tensors").object; const auto &layers = root.at("model").at("layers").array;
+    const auto &tensors = root.at("tensors").object;
     ModelArtifact result;
-    if (root.at("model").at("name").string == "LeNet") {
+    if (root.has("format") && root.at("format").string == "sealtorch-lenet-trainer-v1") {
         result.cnn = true;
-        std::vector<double> conv1, conv2;
-        flatten_tensor(tensors.at("features.0.weight").at("data"), conv1);
-        flatten_tensor(tensors.at("features.3.weight").at("data"), conv2);
-        std::vector<double> bias1, bias2;
-        flatten_tensor(tensors.at("features.0.bias").at("data"), bias1);
-        flatten_tensor(tensors.at("features.3.bias").at("data"), bias2);
-        result.encrypted.add(sealtorch::Linear(lower_convolution(conv1, bias1, 1, 28, 28, 6, 5, 5, 1)));
-        result.encrypted.add(sealtorch::Activation::tanh());
-        result.encrypted.add(sealtorch::Linear(lower_average_pool(6, 24, 24, 2, 2, 2)));
-        result.encrypted.add(sealtorch::Linear(lower_convolution(conv2, bias2, 6, 12, 12, 16, 5, 5, 1)));
-        result.encrypted.add(sealtorch::Activation::tanh());
-        result.encrypted.add(sealtorch::Linear(lower_average_pool(16, 8, 8, 2, 2, 2)));
-        for (const std::string prefix :
-             {"classifier.1", "classifier.3", "classifier.5"}) {
-            result.encrypted.add(sealtorch::Linear(read_dense(tensors, prefix)));
-            if (prefix != "classifier.5") result.encrypted.add(sealtorch::Activation::tanh());
+        const auto &architecture = root.at("architecture");
+        const auto &shape = architecture.at("input").at("shape").array;
+        if (shape.size() != 4 || positive_size(shape[0], "batch") != 1)
+            throw std::runtime_error("trainer export must have a single NCHW input");
+        std::size_t channels = positive_size(shape[1], "input channels");
+        std::size_t height = positive_size(shape[2], "input height");
+        std::size_t width = positive_size(shape[3], "input width");
+        std::size_t widest = channels * height * width;
+        for (const auto &layer : architecture.at("layers").array) {
+            const std::string op = layer.at("op").string;
+            if (op == "conv2d") {
+                if (!zero_pair(layer, "padding") || pair_value(layer, "dilation") != 1 ||
+                    positive_size(layer.at("groups"), "groups") != 1)
+                    throw std::runtime_error("encrypted trainer convolution requires zero padding, dilation 1, and groups 1");
+                const std::size_t input_channels = positive_size(layer.at("in_channels"), "in_channels");
+                const std::size_t outputs = positive_size(layer.at("out_channels"), "out_channels");
+                if (input_channels != channels) throw std::runtime_error("trainer convolution channel mismatch");
+                const std::size_t kernel = pair_value(layer, "kernel");
+                const std::size_t stride = pair_value(layer, "stride");
+                result.encrypted.add(sealtorch::Linear(lower_convolution(read_tensor(tensors, layer.at("weight_key").string), read_tensor(tensors, layer.at("bias_key").string), channels, height, width, outputs, kernel, kernel, stride)));
+                height = (height - kernel) / stride + 1; width = (width - kernel) / stride + 1; channels = outputs;
+                widest = std::max(widest, channels * height * width);
+            } else if (op == "avg_pool2d") {
+                if (!zero_pair(layer, "padding"))
+                    throw std::runtime_error("encrypted trainer average pooling requires zero padding");
+                const std::size_t kernel = pair_value(layer, "kernel"), stride = pair_value(layer, "stride");
+                result.encrypted.add(sealtorch::Linear(lower_average_pool(channels, height, width, kernel, kernel, stride)));
+                height = (height - kernel) / stride + 1; width = (width - kernel) / stride + 1;
+                widest = std::max(widest, channels * height * width);
+            } else if (op == "max_pool2d") {
+                throw std::runtime_error("encrypted inference does not support trainer max_pool2d; use --pooling avg");
+            } else if (op == "flatten") {
+                // Lowered convolution/pooling tensors are already flat NCHW vectors.
+            } else if (op == "linear") {
+                const std::vector<double> weights = read_tensor(tensors, layer.at("weight_key").string);
+                const std::vector<double> biases = read_tensor(tensors, layer.at("bias_key").string);
+                const std::size_t output = positive_size(layer.at("out_features"), "out_features");
+                const std::size_t input = positive_size(layer.at("in_features"), "in_features");
+                if (weights.size() != input * output || biases.size() != output)
+                    throw std::runtime_error("invalid trainer linear tensor");
+                sealtorch::DenseLayer dense{checked_size(input, "linear input"), checked_size(output, "linear output"), {}, biases};
+                dense.weights.resize(output, std::vector<double>(input));
+                for (std::size_t row = 0; row < output; ++row)
+                    std::copy_n(weights.begin() + row * input, input, dense.weights[row].begin());
+                result.encrypted.add(sealtorch::Linear(std::move(dense)));
+            } else if (op == "tanh" || op == "relu" || op == "gelu" || op == "sigmoid" || op == "leaky_relu" || op == "elu" || op == "silu") {
+                result.encrypted.add(activation_for(op));
+            } else {
+                throw std::runtime_error("unsupported trainer operation: " + op);
+            }
         }
+        result.minimum_ring_dimension = 2;
+        while (result.minimum_ring_dimension / 2 < widest)
+            result.minimum_ring_dimension *= 2;
         return result;
     }
-    const std::vector<std::string> names = {"network.1", "network.3", "network.5"};
-    std::size_t layer_position = 0;
-    for (const auto &name : names) {
-        while (layers.at(layer_position).at("type").string != "Linear") ++layer_position;
-        result.encrypted.add(sealtorch::Linear(read_dense(tensors, name)));
-        ++layer_position;
-        if (layer_position < layers.size() && layers[layer_position].at("type").string != "Linear") {
-            const std::string type = layers[layer_position].at("type").string;
-            if (type == "ReLU")
-                result.encrypted.add(sealtorch::Activation::relu());
-            else
-                result.encrypted.add(sealtorch::Activation::gelu());
-        }
-    }
-    return result;
+    throw std::runtime_error("only translated LeNet trainer exports are supported");
 }
 
 struct RunConfig {
@@ -449,27 +485,18 @@ static void print_json_string(const std::string &value)
     std::cout << '"';
 }
 
-static const std::string &model_path(const json::Value &request)
+static std::string model_path(const json::Value &request)
 {
-    static const std::string relu = "src/mnist_mlp.json";
-    static const std::string gelu = "src/mnist_mlp_gelu.json";
-    static const std::string lenet = "src/lenet.json";
-    const std::string selected =
-        request.has("model") ? request.at("model").string : "relu";
-    if (selected == "relu")
-        return relu;
-    if (selected == "gelu")
-        return gelu;
-    if (selected == "lenet")
-        return lenet;
-    throw std::runtime_error("model must be relu, gelu, or lenet");
+    if (request.has("model_path"))
+        return request.at("model_path").string;
+    throw std::runtime_error("a translated LeNet trainer model_path is required");
 }
 
 static std::vector<double> request_pixels(const json::Value &request)
 {
     const json::Value &pixels = request.at("pixels");
-    if (pixels.array.size() != 784)
-        throw std::runtime_error("pixels must contain 784 values");
+    if (pixels.array.size() != 784 && pixels.array.size() != 1024)
+        throw std::runtime_error("pixels must contain 784 or 1024 values");
 
     std::vector<double> input;
     input.reserve(pixels.array.size());
@@ -524,9 +551,9 @@ static int run_web_worker()
     while (std::getline(std::cin, line)) {
         try {
             const json::Value request = json::Parser(line).parse();
-            const std::vector<double> input = request_pixels(request);
             const RunConfig config = parse_config(request);
             const std::string selected_model = model_path(request);
+            const std::vector<double> input = request_pixels(request);
             const bool rebuild =
                 !ciphertext_inference ||
                 config != active_config ||
@@ -544,12 +571,12 @@ static int run_web_worker()
                     options.multiplicative_depth =
                         std::max(options.multiplicative_depth, std::size_t{20});
 
-                    // LeNet's widest tensor has 3,456 packed values.
-                    if (options.ring_dimension < 8192)
+                    const std::size_t required_ring = artifact.minimum_ring_dimension ?
+                        artifact.minimum_ring_dimension : std::size_t{8192};
+                    if (options.ring_dimension < required_ring)
                         throw std::runtime_error(
-                            "LeNet ciphertext inference needs ring_dim "
-                            "of at least 8192");
-                    options.ring_dimension = 8192;
+                            "LeNet ciphertext inference needs a larger ring_dim for its widest feature map");
+                    options.ring_dimension = required_ring;
                 }
                 ciphertext_inference =
                     std::make_unique<sealtorch::CiphertextInference>(

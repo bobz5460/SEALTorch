@@ -37,14 +37,28 @@ class ServerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 server.read_idx(path, 2051)
 
-    def test_plaintext_models_produce_ten_outputs(self):
+    def test_trainer_model_produces_exported_number_of_outputs(self):
         pixels = [0.0] * 784
-        for name in ("relu", "gelu", "lenet"):
-            output, _, device, _ = server.run_plaintext(
-                pixels, name, "cpu")
-            self.assertEqual(device, "cpu")
-            self.assertEqual(len(output), 10)
-            self.assertTrue(all(math.isfinite(value) for value in output))
+        output, _, device, _ = server.run_plaintext(
+            pixels, "trainer:lenet5_mnist", "cpu")
+        self.assertEqual(device, "cpu")
+        self.assertEqual(len(output), 10)
+        self.assertTrue(all(math.isfinite(value) for value in output))
+
+    def test_emnist_web_input_skips_dataset_orientation_correction(self):
+        pixels = [0.0] * 784
+        row, column = 3, 17
+        pixels[row * 28 + column] = 1.0
+
+        image = server.prepare_trainer_pixels(
+            pixels, "trainer:lenet5_emnist-byclass")
+
+        # The export adds a two-pixel border after the dataset-only transpose.
+        # If that transpose reached the canvas input, the ink would instead
+        # appear at (17, 3).
+        self.assertEqual(image.shape, (1, 1, 32, 32))
+        self.assertGreater(float(image[0, 0, row + 2, column + 2]), 0)
+        self.assertLessEqual(float(image[0, 0, column + 2, row + 2]), 0)
 
 
 if __name__ == "__main__":

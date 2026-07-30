@@ -3,6 +3,7 @@
 
 #include <cuda_runtime_api.h>
 #include <fideslib.hpp>
+#include <omp.h>
 
 #include <algorithm>
 #include <chrono>
@@ -278,6 +279,17 @@ namespace sealtorch::cuda
         Implementation(Sequential model_value, CiphertextInferenceOptions options_value)
             : options(std::move(options_value))
         {
+            if (options.thread_count == 0 ||
+                options.thread_count >
+                    static_cast<std::size_t>(std::numeric_limits<int>::max()))
+                throw std::runtime_error(
+                    "CUDA thread count must be between 1 and INT_MAX");
+
+            // FIDESlib dispatches CPU-side work through OpenMP. Its default is
+            // often all host cores, including for CUDA-backed operations.
+            omp_set_dynamic(0);
+            omp_set_num_threads(static_cast<int>(options.thread_count));
+
             std::size_t dense_layer_count = 0;
             const DenseLayer *first_layer = nullptr;
             for (const Operation &operation : model_value.operations())

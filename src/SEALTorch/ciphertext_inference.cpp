@@ -179,6 +179,7 @@ namespace sealtorch
                 if (options.layout != CiphertextLayout::Packed)
                     throw std::runtime_error("CUDA encrypted inference currently supports packed ciphertexts only");
                 cuda::CiphertextInferenceOptions cuda_options{
+                    options.thread_count,
                     options.ring_dimension,
                     options.multiplicative_depth,
                     options.scaling_modulus_bits,

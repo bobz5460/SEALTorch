@@ -13,6 +13,11 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+WEBUI_DIR = pathlib.Path(__file__).resolve().parent
+if str(WEBUI_DIR) not in sys.path:
+    sys.path.insert(0, str(WEBUI_DIR))
+from model_translator import load_export, native_artifact
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 try:
     import torch
@@ -30,6 +35,34 @@ MAX_PLAINTEXT_MODELS = 2
 plaintext_models = OrderedDict()
 plaintext_models_lock = threading.Lock()
 benchmark_jobs = {}
+LENET_ROOT = pathlib.Path(os.environ.get(
+    "SEALTORCH_LENET_ROOT", ROOT.parent / "LeNet-5"))
+
+
+def available_models():
+    """Expose one choice per trainer export, never separate .pt/.json choices."""
+    models = {}
+    if LENET_ROOT.is_dir():
+        for path in sorted(LENET_ROOT.glob("exports/**/*.pt")):
+            models[f"trainer:{path.stem}"] = path
+    return models
+
+
+def model_file(name):
+    models = available_models()
+    if name not in models:
+        raise ValueError("unknown model; choose one advertised by /api/models")
+    return models[name]
+
+
+def is_trainer_model(name):
+    return name.startswith("trainer:")
+
+
+def model_classes(name):
+    if is_trainer_model(name):
+        return load_export(model_file(name)).manifest.get("classes", [])
+    raise ValueError("only LeNet trainer exports are supported")
 
 
 def plaintext_model(name, device):
@@ -40,74 +73,24 @@ def plaintext_model(name, device):
             plaintext_models[cache_key] = model
             return model, False
 
-        paths = {
-            "relu": "mnist_mlp.json",
-            "gelu": "mnist_mlp_gelu.json",
-            "lenet": "lenet.json",
-        }
-        if name not in paths:
-            raise ValueError("model must be relu, gelu, or lenet")
-        path = ROOT / "src" / paths[name]
-        artifact = json.loads(path.read_text())
-        layers = artifact["model"]["layers"]
-        tensors = artifact["tensors"]
-        modules = []
-        linear_index = 0
-        convolution_index = 0
+        if is_trainer_model(name):
+            export = load_export(model_file(name))
+            # Import the trainer implementation only after resolving its export.
+            # That keeps the dashboard usable without the optional sibling repo.
+            lenet_source = str(LENET_ROOT)
+            if lenet_source not in sys.path:
+                sys.path.insert(0, lenet_source)
+            from lenet5 import model_from_architecture
+            model = model_from_architecture(
+                export.manifest["architecture"], len(export.manifest["classes"]))
+            model.load_state_dict(export.state_dict)
+            model = model.eval().to(device)
+            plaintext_models[cache_key] = model
+            while len(plaintext_models) > MAX_PLAINTEXT_MODELS:
+                plaintext_models.popitem(last=False)
+            return model, True
 
-        for item in layers:
-            layer_type = item["type"]
-            if layer_type == "Linear":
-                prefixes = (
-                    ("classifier.1", "classifier.3", "classifier.5")
-                    if name == "lenet"
-                    else ("network.1", "network.3", "network.5")
-                )
-                prefix = prefixes[linear_index]
-                module = torch.nn.Linear(
-                    item["in_features"], item["out_features"])
-                copy_parameters(module, tensors, prefix)
-                modules.append(module)
-                linear_index += 1
-            elif layer_type == "Conv2d":
-                prefix = ("features.0", "features.3")[convolution_index]
-                module = torch.nn.Conv2d(
-                    item["in_channels"],
-                    item["out_channels"],
-                    item["kernel_size"],
-                )
-                copy_parameters(module, tensors, prefix)
-                modules.append(module)
-                convolution_index += 1
-            elif layer_type == "AvgPool2d":
-                modules.append(torch.nn.AvgPool2d(
-                    item["kernel_size"],
-                    item.get("stride", item["kernel_size"]),
-                ))
-            elif layer_type == "Flatten":
-                modules.append(torch.nn.Flatten())
-            elif layer_type == "ReLU":
-                modules.append(torch.nn.ReLU())
-            elif "GELU" in layer_type:
-                modules.append(torch.nn.GELU())
-            elif layer_type == "Tanh":
-                modules.append(torch.nn.Tanh())
-
-        model = torch.nn.Sequential(*modules).eval().to(device)
-        plaintext_models[cache_key] = model
-        while len(plaintext_models) > MAX_PLAINTEXT_MODELS:
-            plaintext_models.popitem(last=False)
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        return model, True
-
-
-def copy_parameters(module, tensors, prefix):
-    with torch.no_grad():
-        module.weight.copy_(torch.tensor(
-            tensors[prefix + ".weight"]["data"], dtype=torch.float32))
-        module.bias.copy_(torch.tensor(
-            tensors[prefix + ".bias"]["data"], dtype=torch.float32))
+        raise ValueError("only LeNet trainer exports are supported")
 
 
 def run_plaintext(pixels, name, requested_device):
@@ -123,10 +106,10 @@ def run_plaintext(pixels, name, requested_device):
     setup_started = time.perf_counter()
     model, initialized = plaintext_model(name, device)
     value = torch.tensor(pixels, dtype=torch.float32, device=device)
-    if name == "lenet":
-        value = value.reshape(1, 1, 28, 28)
+    if is_trainer_model(name):
+        value = prepare_trainer_pixels(pixels, name, device)
     else:
-        value = value.reshape(1, 784)
+        raise ValueError("only LeNet trainer exports are supported")
 
     # CUDA may defer allocation and kernel/module loading until the first
     # invocation.  Warm a newly cached model before starting the inference
@@ -143,6 +126,39 @@ def run_plaintext(pixels, name, requested_device):
         output = model(value)
     if device == "cuda": torch.cuda.synchronize()
     return output.reshape(-1).cpu().double().tolist(), (time.perf_counter() - started) * 1000, device, setup_ms
+
+
+def prepare_trainer_pixels(pixels, name, device="cpu"):
+    """Apply an export's web-input operations to an upright dashboard drawing."""
+    export = load_export(model_file(name))
+    image = torch.tensor(pixels, dtype=torch.float32, device=device).reshape(1, 28, 28)
+    operations = export.manifest.get("preprocessing", {}).get("operations", [])
+    # Early EMNIST exports predate ``apply_to`` and describe both a transpose
+    # and horizontal flip for their sideways source files.  A browser canvas is
+    # already upright, so preserve only the flip needed by those legacy models.
+    legacy_emnist = any(
+        operation.get("reason") == "correct EMNIST storage orientation"
+        and "apply_to" not in operation
+        for operation in operations
+    )
+    for operation in operations:
+        # EMNIST's on-disk images are sideways.  This correction was used only
+        # while reading the dataset and must not be applied to canvas input.
+        if operation.get("apply_to") == "dataset":
+            continue
+        kind = operation.get("op")
+        if legacy_emnist and kind == "transpose":
+            continue
+        if kind == "transpose": image = image.transpose(-2, -1)
+        elif kind == "flip_horizontal": image = image.flip(-1)
+        elif kind == "pad":
+            image = torch.nn.functional.pad(image, (operation["left"], operation["right"], operation["top"], operation["bottom"]), value=operation.get("fill", 0))
+        elif kind == "normalize":
+            image = (image - operation["mean"][0]) / operation["std"][0]
+        elif kind in ("resize", "to_tensor"): pass  # the canvas is already 28×28 float CHW
+        elif kind == "invert": image = 1.0 - image
+        else: raise ValueError(f"unsupported trainer preprocessing operation: {kind}")
+    return image.unsqueeze(0)
 
 
 class HEWorker:
@@ -378,7 +394,7 @@ def usage_telemetry(before, after, elapsed_seconds):
 def execute(request, collect_telemetry=True):
     config = request.get("config", {})
     engine = config.get("engine", "he")
-    model = request.get("model", "relu")
+    model = request.get("model", "trainer:lenet5_mnist")
     if engine not in ("he", "pytorch"):
         raise ValueError("engine must be he or pytorch")
     validate_pixels(request.get("pixels"))
@@ -394,7 +410,12 @@ def execute(request, collect_telemetry=True):
         }
     else:
         binary = select_he_backend(config.get("device", "auto"))
-        result = he_worker.run(request, binary)
+        worker_request = dict(request)
+        if is_trainer_model(model):
+            export = load_export(model_file(model))
+            worker_request["pixels"] = prepare_trainer_pixels(request["pixels"], model).reshape(-1).tolist()
+            worker_request["model_path"] = str(native_artifact(export))
+        result = he_worker.run(worker_request, binary)
         if "error" not in result:
             result["engine"] = "he"
             # The native worker reports whether this request used SEAL CPU or
@@ -409,6 +430,8 @@ def execute(request, collect_telemetry=True):
     if "error" not in result and collect_telemetry:
         result["telemetry"] = usage_telemetry(
             before, telemetry_snapshot(), elapsed)
+    if "error" not in result:
+        result["classes"] = model_classes(model)
     return result
 
 
@@ -541,7 +564,7 @@ def benchmark_runner(
                 result = execute(
                     {
                         "pixels": pixels,
-                        "model": config.get("model", "relu"),
+                        "model": config.get("model", "trainer:lenet5_mnist"),
                         "config": config,
                     },
                     collect_telemetry=False,
@@ -700,6 +723,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/mnist/data":
             self.send_json(mnist_data_status())
             return
+        if self.path == "/api/models":
+            self.send_json({
+                "models": [{"id": name, "label": name.replace("trainer:", "LeNet trainer: "),
+                            "classes": model_classes(name)}
+                           for name in available_models()],
+            })
+            return
         if self.path.startswith("/api/benchmark/"):
             job_id = self.path.rsplit("/", 1)[-1]
             if job_id not in benchmark_jobs:
@@ -730,12 +760,12 @@ class Handler(BaseHTTPRequestHandler):
                 right_config = request.get("right", {})
                 left = execute({
                     "pixels": pixels,
-                    "model": left_config.get("model", "relu"),
+                    "model": left_config.get("model", "trainer:lenet5_mnist"),
                     "config": left_config,
                 })
                 right = execute({
                     "pixels": pixels,
-                    "model": right_config.get("model", "relu"),
+                    "model": right_config.get("model", "trainer:lenet5_mnist"),
                     "config": right_config,
                 })
                 self.send_json({"left": left, "right": right})

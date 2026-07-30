@@ -15,6 +15,10 @@ namespace sealtorch::cuda
     // separate from a model so experiments can vary HE parameters clearly.
     struct CiphertextInferenceOptions
     {
+        // FIDESlib uses OpenMP for host-side work even when the HE kernels
+        // execute on CUDA. Keep this bounded so a GPU inference does not
+        // default to every logical CPU on the machine.
+        std::size_t thread_count = 4;
         std::size_t ring_dimension = 16384;
         std::size_t multiplicative_depth = 15;
         std::size_t scaling_modulus_bits = 40;

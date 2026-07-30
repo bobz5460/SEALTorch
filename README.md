@@ -54,7 +54,10 @@ To select one exact worker binary, set `SEALTORCH_HE_BINARY`.
 - `src/SEALTorch/cuda_ciphertext_inference.*` runs FIDESlib operations.
 - `src/SEALTorch/math.*` contains packed linear algebra and activation fits.
 - `src/SEALTorch/packing.h` finds the sparse diagonals needed by packed CKKS.
-- `src/main.cpp` loads model JSON and implements the native worker protocol.
+- `src/main.cpp` translates JSON model artifacts and implements the native worker protocol.
+- `webui/model_translator.py` accepts the LeNet trainer's self-describing `.pt`
+  bundles or `.json` + `.weights.npz` manifests, folds inference batch norm,
+  and caches native worker artifacts.
 - `webui/server.py` provides the local HTTP API and benchmark runner.
 - `webui/index.html` is the dependency-free dashboard.
 
@@ -69,3 +72,14 @@ The LeNet artifact is currently lowered to sparse linear transforms because the
 native providers share a dense packed interface. This keeps the implementation
 consistent, but it is still more expensive than a provider-specific encrypted
 convolution kernel.
+
+## LeNet trainer exports
+
+When the sibling `../LeNet-5` checkout is present (or `SEALTORCH_LENET_ROOT`
+points to it), the dashboard discovers its `exports/**/*.pt` models. The
+paired `.json` manifests are also supported and use their referenced
+`.weights.npz` tensors. Plaintext runs support every inference method emitted
+by the trainer, including batch norm, dropout, all activations, and both pool
+types. The HE path currently approximates tanh, ReLU, and GELU and supports
+average pooling; it reports a precise error for non-polynomial activations or
+max pooling rather than silently changing the trained network.
