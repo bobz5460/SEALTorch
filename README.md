@@ -90,11 +90,19 @@ paired `.json` manifests are also supported and use their referenced
 `.weights.npz` tensors. Plaintext runs support every inference method emitted
 by the trainer, including batch norm, dropout, all activations, and both pool
 types. The HE path currently approximates tanh, ReLU, and GELU and supports
-average pooling; it reports a precise error for non-polynomial activations or
-max pooling rather than silently changing the trained network.
+average pooling; it reports a precise error for unsupported activations or max
+pooling.
 
-Encrypted activations use one fixed zero-centered Taylor polynomial: `x` for
-ReLU, `x - x³/3` for tanh, and
-`x/2 + 0.3989422804x² - 0.0664903801x⁴` for GELU. There are no fitting ranges,
-adjustable centers, or degree-selection heuristics. The dashboard reports the
-CKKS depth required by these fixed operations.
+Trainer exports are identified by their path below `exports/`, so models with
+the same filename in different experiment folders all appear in the dashboard.
+For encrypted inference, a clamp whose bounds contain zero lowers to the
+identity because that is its zero-centered Taylor series; the PyTorch path
+continues to apply the exact clamp.
+
+Encrypted activations use a zero-centered Taylor polynomial: `x` for ReLU,
+`x - x³/3` for tanh, and
+`x/2 + 0.3989422804x² - 0.0664903801x⁴` for GELU. `activation_degree` selects
+how many available terms are evaluated. The dashboard graphs the activation
+and polynomial over a configurable accuracy range and reports their error on
+that interval. The range is part of run, comparison, and benchmark
+configurations, and saved benchmark results retain the selected value.

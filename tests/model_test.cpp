@@ -58,13 +58,13 @@ namespace
     void test_fixed_taylor_series()
     {
         assert((sealtorch::activation_taylor_coefficients(
-                    sealtorch::ActivationType::Relu) ==
+                    sealtorch::ActivationType::Relu, 4) ==
                 std::vector<double>{0.0, 1.0}));
         assert((sealtorch::activation_taylor_coefficients(
-                    sealtorch::ActivationType::Tanh) ==
+                    sealtorch::ActivationType::Tanh, 3) ==
                 std::vector<double>{0.0, 1.0, 0.0, -1.0 / 3.0}));
         assert(sealtorch::activation_taylor_coefficients(
-                   sealtorch::ActivationType::Gelu).size() == 5);
+                   sealtorch::ActivationType::Gelu, 2).size() == 3);
     }
 }
 

@@ -159,6 +159,7 @@ struct ModelArtifact {
     sealtorch::Sequential encrypted;
     bool cnn = false;
     std::size_t minimum_ring_dimension = 0;
+    std::size_t required_activation_degree = 0;
 };
 
 static void flatten_tensor(const json::Value &value, std::vector<double> &output) {
@@ -253,7 +254,7 @@ static bool zero_pair(const json::Value &layer, const std::string &field) {
 
 static sealtorch::ActivationType activation_for(const std::string &op) {
     if (op == "relu") return sealtorch::ActivationType::Relu;
-    if (op == "gelu") return sealtorch::ActivationType::Gelu;
+    if (op == "gelu" || op == "poly_gelu2") return sealtorch::ActivationType::Gelu;
     if (op == "tanh") return sealtorch::ActivationType::Tanh;
     throw std::runtime_error("encrypted inference does not yet approximate trainer activation: " + op);
 }
@@ -346,6 +347,10 @@ static ModelArtifact load_model(const std::string &path) {
     if (root.has("format") && root.at("format").string == "sealtorch-lenet-trainer-v1") {
         result.cnn = true;
         const auto &architecture = root.at("architecture");
+        if (architecture.has("config") &&
+            architecture.at("config").has("activation") &&
+            architecture.at("config").at("activation").string == "poly_gelu2")
+            result.required_activation_degree = 2;
         const auto &shape = architecture.at("input").at("shape").array;
         if (shape.size() != 4 || positive_size(shape[0], "batch") != 1)
             throw std::runtime_error("trainer export must have a single NCHW input");
@@ -378,6 +383,18 @@ static ModelArtifact load_model(const std::string &path) {
                 throw std::runtime_error("encrypted inference does not support trainer max_pool2d; use --pooling avg");
             } else if (op == "flatten") {
                 // Lowered convolution/pooling tensors are already flat NCHW vectors.
+            } else if (op == "clamp") {
+                const double lower = layer.has("min")
+                    ? layer.at("min").number
+                    : -std::numeric_limits<double>::infinity();
+                const double upper = layer.has("max")
+                    ? layer.at("max").number
+                    : std::numeric_limits<double>::infinity();
+                if (lower > 0.0 || upper < 0.0)
+                    throw std::runtime_error(
+                        "encrypted clamp bounds must contain the Taylor center zero");
+                // Clamp is the identity around zero, so it does not change
+                // the zero-centered Taylor series used by encrypted inference.
             } else if (op == "linear") {
                 const std::vector<double> weights = read_tensor(tensors, layer.at("weight_key").string);
                 const std::vector<double> biases = read_tensor(tensors, layer.at("bias_key").string);
@@ -391,7 +408,9 @@ static ModelArtifact load_model(const std::string &path) {
                     std::copy_n(weights.begin() + row * input, input, dense.weights[row].begin());
                 result.encrypted.add(std::move(dense));
                 widest = std::max({widest, input, output});
-            } else if (op == "tanh" || op == "relu" || op == "gelu" || op == "sigmoid" || op == "leaky_relu" || op == "elu" || op == "silu") {
+            } else if (op == "tanh" || op == "relu" || op == "gelu" ||
+                       op == "poly_gelu2" || op == "sigmoid" ||
+                       op == "leaky_relu" || op == "elu" || op == "silu") {
                 result.encrypted.add(activation_for(op));
             } else {
                 throw std::runtime_error("unsupported trainer operation: " + op);
@@ -469,6 +488,7 @@ struct RunConfig {
     int scaling_mod_bits = 40;
     int first_mod_bits = 50;
     int scale_bits = 40;
+    int activation_degree = 3;
 
     bool operator==(const RunConfig &) const = default;
 };
@@ -507,6 +527,7 @@ static RunConfig parse_config(const json::Value &request)
     config.scaling_mod_bits = int_or(value, "scaling_mod_bits", 40);
     config.first_mod_bits = int_or(value, "first_mod_bits", 50);
     config.scale_bits = int_or(value, "scale_bits", 40);
+    config.activation_degree = int_or(value, "activation_degree", 3);
 
     if (threads < 1)
         throw std::runtime_error("threads must be greater than zero");
@@ -518,6 +539,8 @@ static RunConfig parse_config(const json::Value &request)
     if (config.depth < 1 || config.scaling_mod_bits < 1 ||
         config.first_mod_bits < 1 || config.scale_bits < 1)
         throw std::runtime_error("ciphertext bit sizes must be positive");
+    if (config.activation_degree < 1 || config.activation_degree > 4)
+        throw std::runtime_error("activation_degree must be between 1 and 4");
     if (config.device != "cuda" &&
         config.scale_bits != config.scaling_mod_bits)
         throw std::runtime_error(
@@ -546,6 +569,7 @@ static sealtorch::CiphertextInferenceOptions ciphertext_inference_options(
         static_cast<std::size_t>(config.scaling_mod_bits),
         static_cast<std::size_t>(config.first_mod_bits),
         static_cast<std::size_t>(config.scale_bits),
+        static_cast<std::size_t>(config.activation_degree),
         0
     };
     return options;
@@ -570,6 +594,13 @@ static void print_numbers(const std::vector<double> &values)
     for (std::size_t index = 0; index < values.size(); ++index) {
         if (index != 0)
             std::cout << ',';
+        // JSON has no NaN/Infinity literals. Do this final boundary check as
+        // well as provider-side validation so a bad backend result can never
+        // corrupt the line protocol consumed by the dashboard.
+        if (!std::isfinite(values[index]))
+            throw std::runtime_error(
+                "ciphertext inference produced a non-finite value before JSON serialization; "
+                "increase CKKS precision or reduce the circuit depth");
         std::cout << std::setprecision(12) << values[index];
     }
     std::cout << ']';
@@ -611,11 +642,14 @@ static std::vector<double> request_pixels(const json::Value &request)
 }
 
 static std::size_t activation_multiplicative_depth(
-    sealtorch::ActivationType type)
+    sealtorch::ActivationType type,
+    std::size_t degree)
 {
     if (type == sealtorch::ActivationType::Relu) return 0;
-    if (type == sealtorch::ActivationType::Tanh) return 3;
-    return 4;
+    if (type == sealtorch::ActivationType::Tanh)
+        return degree >= 3 ? 3 : 1;
+    if (degree >= 4) return 4;
+    return degree >= 2 ? 2 : 1;
 }
 
 static void print_result(
@@ -625,6 +659,13 @@ static void print_result(
     std::size_t memory_after,
     bool used_cuda)
 {
+    // Validate before writing the first byte. The web worker is line-oriented;
+    // throwing after a partial JSON response would poison the next response.
+    if (!std::all_of(result.values.begin(), result.values.end(),
+                     [](double value) { return std::isfinite(value); }))
+        throw std::runtime_error(
+            "ciphertext inference produced a non-finite value before JSON serialization; "
+            "increase CKKS precision or reduce the circuit depth");
     std::cout << "{\"encrypted\":";
     print_numbers(result.values);
     std::cout
@@ -649,7 +690,7 @@ static void print_result(
         << ",\"relin_keys_bytes\":" << result.relin_keys_bytes
         << ",\"galois_keys_bytes\":" << result.galois_keys_bytes
         << ",\"backend\":\"packed\""
-        << "\",\"device\":\"" << (used_cuda ? "cuda" : "cpu")
+        << ",\"device\":\"" << (used_cuda ? "cuda" : "cpu")
         << "\"}\n";
 }
 
@@ -677,6 +718,13 @@ static int run_web_worker()
                 ModelArtifact artifact = load_model(selected_model);
                 sealtorch::CiphertextInferenceOptions options =
                     ciphertext_inference_options(config);
+                if (artifact.required_activation_degree != 0 &&
+                    options.activation_degree !=
+                        artifact.required_activation_degree)
+                    throw std::runtime_error(
+                        "this HE-trained model requires activation_degree " +
+                        std::to_string(artifact.required_activation_degree) +
+                        " so ciphertext inference matches its training graph");
                 if (artifact.cnn) {
                     // Every lowered linear transform consumes one rescale and
                     // Each fixed Taylor term consumes one rescale level.
@@ -691,7 +739,8 @@ static int run_web_worker()
                         else if (operation.kind ==
                                  sealtorch::OperationKind::Activation) {
                             required_depth += activation_multiplicative_depth(
-                                operation.activation_type);
+                                operation.activation_type,
+                                options.activation_degree);
                         }
                     }
                     if (options.multiplicative_depth < required_depth)

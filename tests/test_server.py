@@ -13,6 +13,22 @@ SPEC.loader.exec_module(server)
 
 
 class ServerTests(unittest.TestCase):
+    def test_duplicate_export_names_get_distinct_model_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for group in ("original", "clamped"):
+                path = root / "exports" / group / "same_name.pt"
+                path.parent.mkdir(parents=True)
+                path.touch()
+            previous = server.LENET_ROOT
+            try:
+                server.LENET_ROOT = root
+                models = server.available_models()
+            finally:
+                server.LENET_ROOT = previous
+        self.assertIn("trainer:original/same_name", models)
+        self.assertIn("trainer:clamped/same_name", models)
+
     def test_validate_pixels(self):
         server.validate_pixels([0.5] * 784)
         with self.assertRaises(ValueError):
@@ -22,6 +38,8 @@ class ServerTests(unittest.TestCase):
 
     def test_trainer_model_produces_exported_number_of_outputs(self):
         pixels = [0.0] * 784
+        self.assertIn(server.model_activation("trainer:lenet5_mnist"),
+                      ("relu", "gelu", "tanh"))
         output, _, device, _ = server.run_plaintext(
             pixels, "trainer:lenet5_mnist", "cpu")
         self.assertEqual(device, "cpu")
@@ -56,7 +74,12 @@ class ServerTests(unittest.TestCase):
                 server.RESULTS_DIR = pathlib.Path(directory)
                 server.benchmark_runner(
                     job_id,
-                    {"model": "trainer:emnist-lenet5-gelu", "engine": "pytorch", "device": "cpu"},
+                    {
+                        "model": "trainer:emnist-lenet5-gelu",
+                        "engine": "pytorch",
+                        "device": "cpu",
+                        "activation_range": "2",
+                    },
                     limit=1,
                     batch_size=1,
                 )
@@ -67,6 +90,38 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(result["dataset"], "emnist-byclass")
         self.assertEqual(len(result["classes"]), 62)
         self.assertEqual(len(result["confusion_matrix"]), 62)
+        self.assertEqual(result["config"]["activation_range"], "2")
+
+    def test_saved_result_loader_stays_inside_results_directory(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            previous = server.RESULTS_DIR
+            server.RESULTS_DIR = pathlib.Path(directory)
+            try:
+                path = server.RESULTS_DIR / "mnist-benchmark-example.json"
+                path.write_text('{"id":"example","confusion_matrix":[[1]]}')
+                entries = server.saved_benchmark_results()
+                self.assertEqual(entries[0]["file"], path.name)
+                self.assertEqual(server.saved_benchmark_result(path.name)["id"], "example")
+                with self.assertRaises(ValueError):
+                    server.saved_benchmark_result("../outside.json")
+            finally:
+                server.RESULTS_DIR = previous
+
+    def test_ckks_decode_failure_has_actionable_benchmark_message(self):
+        message = server.benchmark_error_message(
+            RuntimeError("Decode(): The decryption failed because the approximation error is too high."),
+            {"activation_degree": "3"})
+        self.assertIn("no benchmark samples were recorded", message)
+        self.assertIn("ring 65536", message)
+        self.assertIn("degree is 3", message)
+
+    def test_he_native_emnist_export_advertises_its_exact_cuda_profile(self):
+        name = "trainer:emnist-he/lenet_he_emnist-byclass"
+        if name not in server.available_models():
+            self.skipTest("HE-native EMNIST export is not installed")
+        self.assertEqual(server.model_activation(name), "poly_gelu2")
+        self.assertEqual(server.model_he_activation_degree(name), 2)
+        self.assertEqual(server.model_he_profile(name)["ring_dim"], 8192)
 
 
 if __name__ == "__main__":

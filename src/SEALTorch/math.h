@@ -10,13 +10,14 @@ namespace sealtorch
 {
     class ThreadPool;
 
-    // Fixed, zero-centered Taylor coefficients for the supported activation.
-    std::vector<double> activation_taylor_coefficients(ActivationType type);
+    // Zero-centered Taylor coefficients, truncated to the requested degree.
+    std::vector<double> activation_taylor_coefficients(
+        ActivationType type, std::size_t degree);
 
     seal::Ciphertext approximate_activation(
         const seal::Evaluator& evaluator, const seal::RelinKeys& relin_keys,
         seal::CKKSEncoder& encoder, const seal::Ciphertext& input,
-        double scale, ActivationType type);
+        double scale, ActivationType type, std::size_t degree);
 
     struct EncodedDiagonal
     {

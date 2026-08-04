@@ -202,11 +202,11 @@ namespace sealtorch::cuda
         Ciphertext activate(
             const Context &context,
             const Ciphertext &input,
-            ActivationType type)
+            ActivationType type,
+            std::size_t degree)
         {
-            const auto coefficients = activation_taylor_coefficients(type);
+            const auto coefficients = activation_taylor_coefficients(type, degree);
             const std::size_t highest = coefficients.size() - 1;
-            if (highest == 1) return input;
 
             Ciphertext result = input->Clone();
             if (coefficients[highest] != 1.0) {
@@ -340,7 +340,9 @@ namespace sealtorch::cuda
             {
                 encrypted = linear(context, encrypted, layer);
                 if (layer.has_activation)
-                    encrypted = activate(context, encrypted, layer.activation);
+                    encrypted = activate(
+                        context, encrypted, layer.activation,
+                        options.activation_degree);
             }
             cudaDeviceSynchronize();
             const auto evaluate_end = std::chrono::steady_clock::now();

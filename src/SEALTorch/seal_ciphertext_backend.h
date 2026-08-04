@@ -16,6 +16,7 @@ namespace sealtorch
         seal::CKKSEncoder &encoder;
         double scale;
         std::size_t thread_count = 4;
+        std::size_t activation_degree = 3;
     };
 
     // SEALTorch receives encrypted user data and returns encrypted results.

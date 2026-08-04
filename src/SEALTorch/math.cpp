@@ -1,27 +1,36 @@
 #include "math.h"
 #include "thread_pool.h"
 
+#include <algorithm>
+
 namespace sealtorch
 {
-    std::vector<double> activation_taylor_coefficients(ActivationType type)
+    std::vector<double> activation_taylor_coefficients(
+        ActivationType type, std::size_t degree)
     {
+        std::vector<double> coefficients;
         if (type == ActivationType::Relu)
-            return {0.0, 1.0};
-        if (type == ActivationType::Tanh)
-            return {0.0, 1.0, 0.0, -1.0 / 3.0};
-        return {0.0, 0.5, 0.3989422804014327, 0.0,
-                -0.0664903800669054};
+            coefficients = {0.0, 1.0};
+        else if (type == ActivationType::Tanh)
+            coefficients = {0.0, 1.0, 0.0, -1.0 / 3.0};
+        else
+            coefficients = {0.0, 0.5, 0.3989422804014327, 0.0,
+                            -0.0664903800669054};
+        coefficients.resize(std::min(std::max<std::size_t>(degree, 1) + 1,
+                                     coefficients.size()));
+        while (coefficients.size() > 2 && coefficients.back() == 0.0)
+            coefficients.pop_back();
+        return coefficients;
     }
 
     seal::Ciphertext approximate_activation(
         const seal::Evaluator &evaluator, const seal::RelinKeys &relin_keys,
         seal::CKKSEncoder &encoder, const seal::Ciphertext &input, double scale,
-        ActivationType type)
+        ActivationType type, std::size_t degree)
     {
         const std::vector<double> coefficients =
-            activation_taylor_coefficients(type);
+            activation_taylor_coefficients(type, degree);
         const std::size_t highest = coefficients.size() - 1;
-        if (highest == 1) return input;
 
         seal::Ciphertext result = input;
         if (coefficients[highest] != 1.0) {

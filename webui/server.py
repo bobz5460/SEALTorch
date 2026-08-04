@@ -36,6 +36,8 @@ MAX_PLAINTEXT_MODELS = 2
 plaintext_models = OrderedDict()
 plaintext_models_lock = threading.Lock()
 benchmark_jobs = {}
+benchmark_jobs_lock = threading.Lock()
+active_benchmark_jobs = set()
 LENET_ROOT = pathlib.Path(os.environ.get(
     "SEALTORCH_LENET_ROOT", ROOT.parent / "LeNet-5"))
 NIST19_ROOT = pathlib.Path(os.environ.get(
@@ -48,19 +50,30 @@ NATIVE_MODELS = {
 
 
 def available_models():
-    """Expose one choice per trainer export, never separate .pt/.json choices."""
+    """Expose every trainer export under a stable, collision-free ID."""
     models = {name: path for name, path in NATIVE_MODELS.items() if path.is_file()}
-    if LENET_ROOT.is_dir():
-        for path in sorted(LENET_ROOT.glob("exports/**/*.pt")):
-            models[f"trainer:{path.stem}"] = path
+    exports = LENET_ROOT / "exports"
+    if exports.is_dir():
+        for path in sorted(exports.glob("**/*.pt")):
+            relative = path.relative_to(exports).with_suffix("")
+            models[f"trainer:{relative.as_posix()}"] = path
     return models
 
 
 def model_file(name):
     models = available_models()
-    if name not in models:
-        raise ValueError("unknown model; choose one advertised by /api/models")
-    return models[name]
+    if name in models:
+        return models[name]
+    # Keep old bookmarks and API clients working. Stem-only IDs resolve to
+    # the most recently written export, while the advertised path IDs remain
+    # unambiguous.
+    if name.startswith("trainer:") and "/" not in name:
+        stem = name.removeprefix("trainer:")
+        matches = [path for key, path in models.items()
+                   if key.startswith("trainer:") and path.stem == stem]
+        if matches:
+            return max(matches, key=lambda path: path.stat().st_mtime_ns)
+    raise ValueError("unknown model; choose one advertised by /api/models")
 
 
 def is_trainer_model(name):
@@ -83,6 +96,41 @@ def model_classes(name):
     if is_native_model(name):
         return native_manifest(name)["model"]["outputs"].get("classes", [])
     raise ValueError("unknown model")
+
+
+def model_activation(name):
+    if is_trainer_model(name):
+        layers = load_export(model_file(name)).manifest["architecture"]["layers"]
+        return next((layer["op"] for layer in layers
+                     if layer.get("op") in ("relu", "gelu", "poly_gelu2", "tanh")), "tanh")
+    types = [layer.get("type", "").lower()
+             for layer in native_manifest(name)["model"]["layers"]]
+    if any("gelu" in item for item in types):
+        return "gelu"
+    return "relu" if "relu" in types else "tanh"
+
+
+def model_he_activation_degree(name):
+    """An HE-native export declares the only polynomial degree it supports."""
+    if not is_trainer_model(name):
+        return None
+    config = load_export(model_file(name)).manifest["architecture"].get("config", {})
+    return 2 if config.get("activation") == "poly_gelu2" else None
+
+
+def model_he_profile(name):
+    """Measured CUDA CKKS parameters for the compact HE-trained export."""
+    if model_he_activation_degree(name) != 2:
+        return None
+    return {
+        "device": "cuda",
+        "ring_dim": 8192,
+        "depth": 14,
+        "scaling_mod_bits": 50,
+        "first_mod_bits": 60,
+        "scale_bits": 50,
+        "activation_degree": 2,
+    }
 
 
 def model_preprocessing(name):
@@ -206,7 +254,32 @@ def plaintext_model(name, device):
         raise ValueError("unknown model")
 
 
-def run_plaintext(pixels, name, requested_device, prepared_input=None):
+def gpu_index(config):
+    """Validate the selected physical CUDA GPU and return its index."""
+    value = config.get("gpu_id", 0)
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("GPU index must be a non-negative integer")
+    if value < 0:
+        raise ValueError("GPU index must be a non-negative integer")
+    if torch.cuda.is_available() and value >= torch.cuda.device_count():
+        raise ValueError(f"GPU {value} is unavailable (host has {torch.cuda.device_count()} CUDA GPU(s))")
+    devices = cuda_devices()
+    if devices and value not in {device["id"] for device in devices}:
+        raise ValueError(f"GPU {value} is unavailable")
+    return value
+
+
+def selected_gpu_for(config, prefer_cuda=False):
+    """GPU used by a CUDA request; auto follows the dashboard's CUDA choice."""
+    device = config.get("device", "auto")
+    return gpu_index(config) if device == "cuda" or (
+        device == "auto" and (torch.cuda.is_available() or
+                               (prefer_cuda and bool(cuda_devices())))) else None
+
+
+def run_plaintext(pixels, name, requested_device, prepared_input=None, selected_gpu=0):
     if requested_device not in ("auto", "cpu", "cuda"):
         raise ValueError("device must be auto, cpu, or cuda")
     if requested_device == "cuda" and not torch.cuda.is_available():
@@ -215,7 +288,7 @@ def run_plaintext(pixels, name, requested_device, prepared_input=None):
         requested_device == "cuda"
         or (requested_device == "auto" and torch.cuda.is_available())
     )
-    device = "cuda" if use_cuda else "cpu"
+    device = f"cuda:{selected_gpu}" if use_cuda else "cpu"
     setup_started = time.perf_counter()
     model, initialized = plaintext_model(name, device)
     if not (is_trainer_model(name) or is_native_model(name)):
@@ -230,14 +303,14 @@ def run_plaintext(pixels, name, requested_device, prepared_input=None):
     if initialized:
         with torch.inference_mode():
             model(value)
-        if device == "cuda":
-            torch.cuda.synchronize()
+        if use_cuda:
+            torch.cuda.synchronize(selected_gpu)
     setup_ms = (time.perf_counter() - setup_started) * 1000 if initialized else 0
-    if device == "cuda": torch.cuda.synchronize()
+    if use_cuda: torch.cuda.synchronize(selected_gpu)
     started = time.perf_counter()
     with torch.inference_mode():
         output = model(value)
-    if device == "cuda": torch.cuda.synchronize()
+    if use_cuda: torch.cuda.synchronize(selected_gpu)
     return output.reshape(-1).cpu().double().tolist(), (time.perf_counter() - started) * 1000, device, setup_ms
 
 
@@ -346,11 +419,12 @@ def normalize_foreground(image, *, canvas_size=28, foreground_size=20, threshold
 
 
 class HEWorker:
-    """One warm HE context per configuration; replaces it on a change."""
-    def __init__(self):
+    """One warm worker for one configuration and, when applicable, one GPU."""
+    def __init__(self, gpu_id=None):
         self.process = None
         self.config_key = None
         self.lock = threading.Lock()
+        self.gpu_id = gpu_id
 
     def close(self):
         if self.process is not None:
@@ -366,8 +440,15 @@ class HEWorker:
             if self.process is None or self.process.poll() is not None or self.config_key != (binary, config_key):
                 worker_startup_started = time.perf_counter()
                 self.close()
+                environment = os.environ.copy()
+                # FIDES/CUDA can otherwise initialise a context on every visible GPU.
+                # Masking gives this process exactly one physical GPU, so concurrent
+                # workers cannot reserve VRAM on GPUs belonging to other jobs.
+                if self.gpu_id is not None:
+                    environment["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
                 self.process = subprocess.Popen([str(binary), "--web-worker"], cwd=ROOT,
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, bufsize=1, env=environment)
                 self.config_key = (binary, config_key)
                 worker_startup_ms = (time.perf_counter() - worker_startup_started) * 1000
             self.process.stdin.write(json.dumps(request) + "\n")
@@ -380,14 +461,32 @@ class HEWorker:
                     raise RuntimeError(detail)
                 line = line.strip()
                 if line.startswith("{"):
-                    response = json.loads(line)
+                    try:
+                        response = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        self.close()
+                        raise RuntimeError(
+                            "ciphertext worker returned malformed JSON; it likely produced "
+                            "a non-finite CKKS value. Increase precision or reduce the "
+                            f"circuit depth ({error.msg}).") from error
                     # The worker measures context/model/key initialization.  Process
                     # startup is also setup work, so expose it separately from inference.
                     response["worker_startup_ms"] = worker_startup_ms
                     return response
 
 
-he_worker = HEWorker()
+he_workers = {}
+he_workers_lock = threading.Lock()
+
+
+def he_worker_for(config):
+    """Return an isolated warm worker; CUDA workers are pinned per GPU."""
+    gpu_id = selected_gpu_for(config, prefer_cuda=True)
+    key = ("cuda", gpu_id) if gpu_id is not None else ("cpu-or-auto", None)
+    with he_workers_lock:
+        if key not in he_workers:
+            he_workers[key] = HEWorker(gpu_id)
+        return he_workers[key]
 
 
 def select_he_backend(requested_device):
@@ -416,13 +515,31 @@ def he_capabilities():
         return {"cpu": True, "cuda": False}
 
 
-def gpu_power_watts():
+def cuda_devices():
+    """List selectable GPUs without creating a CUDA context in this server."""
+    try:
+        lines = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=3, check=True).stdout.splitlines()
+        return [{"id": int(index.strip()), "name": name.strip()}
+                for line in lines for index, name in [line.split(",", 1)]]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def gpu_power_watts(selected_gpu=None):
     """Best-effort telemetry; unavailable sensors intentionally return null."""
     try:
         output = subprocess.run(
-            ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,power.draw", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=2, check=True).stdout.splitlines()
-        values = [float(value.strip()) for value in output if value.strip() not in ("N/A", "[Not Supported]")]
+        values = []
+        for line in output:
+            index, value = (part.strip() for part in line.split(",", 1))
+            if selected_gpu is not None and int(index) != selected_gpu:
+                continue
+            if value not in ("N/A", "[Not Supported]"):
+                values.append(float(value))
         return sum(values) if values else None
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -491,8 +608,9 @@ def cpu_energy_snapshot():
     return {"counters": counters, "reason": None}
 
 
-def telemetry_snapshot():
-    return {"gpu_power_w": gpu_power_watts(), "platform_power_w": platform_power_watts(),
+def telemetry_snapshot(selected_gpu=None):
+    return {"gpu_power_w": gpu_power_watts(selected_gpu), "gpu_id": selected_gpu,
+            "platform_power_w": platform_power_watts(),
             "cpu": cpu_energy_snapshot()}
 
 
@@ -575,6 +693,28 @@ def usage_telemetry(before, after, elapsed_seconds):
     }
 
 
+def benchmark_error_message(error, config=None):
+    """Turn provider precision failures into a configuration remedy.
+
+    FIDES reports this only at CKKS decode time.  The benchmark has no valid
+    prediction, accuracy, or latency sample in that case, so make that clear
+    instead of leaving a misleading partial result in the dashboard.
+    """
+    message = str(error)
+    if "approximation error is too high" in message:
+        config = config or {}
+        degree = config.get("activation_degree", "the selected")
+        return (
+            "CUDA CKKS precision was exhausted before decode; no benchmark "
+            f"samples were recorded. The selected Taylor degree is {degree}. "
+            "Apply the Deep CUDA profile (ring 65536, scaling modulus 59 "
+            "bits, first modulus 60 bits) only as a diagnostic retry; it "
+            "uses substantially more GPU memory and is not the preferred "
+            "long-term model design."
+        )
+    return message
+
+
 def execute(request, collect_telemetry=True):
     config = request.get("config", {})
     engine = config.get("engine", "he")
@@ -592,12 +732,13 @@ def execute(request, collect_telemetry=True):
         prepared_input = (prepare_trainer_pixels(request["pixels"], model)
                           if is_trainer_model(model)
                           else prepare_native_pixels(request["pixels"]))
-    before = telemetry_snapshot() if collect_telemetry else None
+    selected_gpu = selected_gpu_for(config, prefer_cuda=engine == "he")
+    before = telemetry_snapshot(selected_gpu) if collect_telemetry else None
     started = time.monotonic()
     if engine == "pytorch":
         output, runtime_ms, device, setup_ms = run_plaintext(
             request["pixels"], model, config.get("device", "auto"),
-            prepared_input=prepared_input)
+            prepared_input=prepared_input, selected_gpu=selected_gpu or 0)
         result = {
             "engine": "pytorch", "device": device, "output": output,
             "execution_ms": runtime_ms, "plain_ms": runtime_ms,
@@ -613,7 +754,7 @@ def execute(request, collect_telemetry=True):
         worker_request["model_path"] = str(
             native_artifact(load_export(model_file(model)))
             if is_trainer_model(model) else model_file(model))
-        result = he_worker.run(worker_request, binary)
+        result = he_worker_for(config).run(worker_request, binary)
         if "error" not in result:
             result["engine"] = "he"
             # The native worker reports whether this request used SEAL CPU or
@@ -624,10 +765,12 @@ def execute(request, collect_telemetry=True):
                 result.get("setup_ms", 0)
                 + result.get("worker_startup_ms", 0)
             )
+            if result.get("device") == "cuda":
+                result["device"] = f"cuda:{selected_gpu or 0}"
     elapsed = time.monotonic() - started
     if "error" not in result and collect_telemetry:
         result["telemetry"] = usage_telemetry(
-            before, telemetry_snapshot(), elapsed)
+            before, telemetry_snapshot(selected_gpu), elapsed)
     if "error" not in result:
         result["classes"] = model_classes(model)
     return result
@@ -827,8 +970,17 @@ def benchmark_runner(
         stride=1,
     shuffle_seed=None):
     job = benchmark_jobs[job_id]
+    # RAPL and node meters are host-wide counters.  Mark every overlapping job
+    # so we never present shared CPU energy as if it belonged to one benchmark.
+    with benchmark_jobs_lock:
+        if active_benchmark_jobs:
+            job["telemetry_shared"] = True
+            for active_id in active_benchmark_jobs:
+                benchmark_jobs[active_id]["telemetry_shared"] = True
+        active_benchmark_jobs.add(job_id)
     try:
         name = config.get("model", "trainer:lenet5_mnist")
+        selected_gpu = selected_gpu_for(config, prefer_cuda=config.get("engine") == "he")
         dataset = trainer_validation_set(name)
         labels, classes = dataset.labels, dataset.classes
         if not classes:
@@ -842,7 +994,7 @@ def benchmark_runner(
         job.update({"status": "running", "total": count, "completed": 0})
         latencies, setup_times, correct, predictions = [], [], 0, []
         confusion = [[0] * len(classes) for _ in classes]
-        power_before, benchmark_started = telemetry_snapshot(), time.monotonic()
+        power_before, benchmark_started = telemetry_snapshot(selected_gpu), time.monotonic()
         for begin in range(0, count, batch_size):
             for index in range(begin, min(begin + batch_size, count)):
                 dataset_index = indices[index]
@@ -916,6 +1068,17 @@ def benchmark_runner(
         ]
         initialization_events = sum(
             1 for setup_ms in setup_times if setup_ms > 0)
+        telemetry = usage_telemetry(
+            power_before, telemetry_snapshot(selected_gpu), elapsed)
+        if job.get("telemetry_shared"):
+            telemetry.update({
+                "cpu_energy_j": None, "cpu_power_w": None,
+                "platform_energy_j": None, "platform_power_w": None,
+                "total_energy_j": telemetry["gpu_energy_j"],
+                "total_power_w": telemetry["gpu_power_w"],
+                "cpu_power_reason": "CPU/package energy is shared by concurrent benchmarks",
+                "platform_power_reason": "Node power is shared by concurrent benchmarks",
+            })
         summary = {
             "id": job_id,
             "created_at": job["created_at"],
@@ -948,8 +1111,7 @@ def benchmark_runner(
             "latency_ms": latencies,
             "setup_ms": setup_times,
             "predictions": predictions,
-            "telemetry": usage_telemetry(
-                power_before, telemetry_snapshot(), elapsed),
+            "telemetry": telemetry,
         }
         RESULTS_DIR.mkdir(exist_ok=True)
         destination = RESULTS_DIR / f"{dataset.dataset}-benchmark-{job_id}.json"
@@ -960,7 +1122,10 @@ def benchmark_runner(
             **summary,
         })
     except Exception as error:
-        job.update({"status": "failed", "error": str(error)})
+        job.update({"status": "failed", "error": benchmark_error_message(error, config)})
+    finally:
+        with benchmark_jobs_lock:
+            active_benchmark_jobs.discard(job_id)
 
 
 def start_benchmark(
@@ -975,12 +1140,13 @@ def start_benchmark(
     if limit < 0:
         raise ValueError("benchmark limit cannot be negative")
     job_id = uuid.uuid4().hex[:12]
-    benchmark_jobs[job_id] = {
-        "id": job_id,
-        "status": "queued",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "config": config,
-    }
+    with benchmark_jobs_lock:
+        benchmark_jobs[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "config": config,
+        }
     arguments = (
         job_id,
         config,
@@ -996,6 +1162,39 @@ def start_benchmark(
         daemon=True,
     ).start()
     return benchmark_jobs[job_id]
+
+
+def saved_benchmark_results():
+    """Small manifest for the result-file picker; never trust client paths."""
+    if not RESULTS_DIR.is_dir():
+        return []
+    entries = []
+    for path in sorted(RESULTS_DIR.glob("*-benchmark-*.json"),
+                       key=lambda item: item.stat().st_mtime_ns, reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            entries.append({
+                "file": path.name, "id": data.get("id"),
+                "finished_at": data.get("finished_at"),
+                "dataset": data.get("dataset"), "samples": data.get("samples"),
+                "accuracy": data.get("accuracy"), "config": data.get("config", {}),
+            })
+        except (OSError, json.JSONDecodeError):
+            continue
+    return entries
+
+
+def saved_benchmark_result(filename):
+    # Path.name rejects traversal and restricts reads to server-exported JSON.
+    if pathlib.Path(filename).name != filename or not filename.endswith(".json"):
+        raise ValueError("invalid result filename")
+    path = RESULTS_DIR / filename
+    if not path.is_file():
+        raise FileNotFoundError("result file was not found")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or "confusion_matrix" not in data:
+        raise ValueError("result file is not a SEALTorch benchmark export")
+    return {"status": "complete", "result_file": str(path.relative_to(ROOT)), **data}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1014,6 +1213,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({
                 "ok": capabilities["cpu"],
                 "he_backends": capabilities,
+                "gpus": cuda_devices(),
             })
             return
         if path.path == "/api/mnist/data":
@@ -1028,10 +1228,23 @@ class Handler(BaseHTTPRequestHandler):
                 "models": [{"id": name, "label": (name.replace("trainer:", "LeNet trainer: ")
                                                       if is_trainer_model(name) else f"Bundled native: {name}"),
                             "classes": model_classes(name),
+                            "activation": model_activation(name),
+                            "he_activation_degree": model_he_activation_degree(name),
+                            "he_profile": model_he_profile(name),
                             "preprocessing": model_preprocessing(name),
                             "minimum_ring_dimension": model_minimum_ring_dimension(name)}
                            for name in available_models()],
             })
+            return
+        if path.path == "/api/benchmarks":
+            # The list is intentionally compact: details remain on the
+            # per-job endpoint so polling several concurrent runs is cheap.
+            with benchmark_jobs_lock:
+                jobs = [{key: job.get(key) for key in (
+                    "id", "status", "completed", "total", "created_at",
+                    "accuracy", "mean_latency_ms", "error", "config")}
+                    for job in benchmark_jobs.values()]
+            self.send_json({"jobs": jobs})
             return
         if path.path.startswith("/api/benchmark/"):
             job_id = path.path.rsplit("/", 1)[-1]
@@ -1039,6 +1252,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "benchmark not found"}, 404)
             else:
                 self.send_json(benchmark_jobs[job_id])
+            return
+        if path.path == "/api/results":
+            self.send_json({"results": saved_benchmark_results()})
+            return
+        if path.path.startswith("/api/results/"):
+            try:
+                self.send_json(saved_benchmark_result(
+                    urllib.parse.unquote(path.path.removeprefix("/api/results/"))))
+            except FileNotFoundError as error:
+                self.send_json({"error": str(error)}, 404)
+            except (ValueError, OSError, json.JSONDecodeError) as error:
+                self.send_json({"error": str(error)}, 400)
             return
         if path.path not in ("/", "/index.html"):
             self.send_error(404)
