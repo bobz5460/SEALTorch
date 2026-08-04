@@ -2,6 +2,7 @@
 
 #include <SEALTorch/model.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -52,12 +53,21 @@ namespace sealtorch
                static_cast<std::int32_t>(slot_count);
     }
 
-    inline std::size_t baby_step_size(std::size_t slot_count)
+    // BSGS only needs a key for a rotation that a non-zero matrix diagonal
+    // uses.  The old slot-count-only choice works well for a fully dense
+    // slot-by-slot matrix, but it produces needlessly many Galois keys for
+    // the much smaller CNN and classifier matrices used here.  Size the baby
+    // step from the active work instead.  This keeps the two BSGS directions
+    // balanced while dramatically reducing first-load key generation.
+    inline std::size_t baby_step_size(
+        std::size_t slot_count,
+        std::size_t active_diagonal_count)
     {
         std::size_t size = 1;
-        while (size * size < slot_count)
+        const std::size_t work = std::max<std::size_t>(1, active_diagonal_count);
+        while (size * size < work)
             ++size;
-        return size;
+        return std::min(size, slot_count);
     }
 
     struct DiagonalSplit
@@ -68,9 +78,8 @@ namespace sealtorch
 
     inline DiagonalSplit split_diagonal(
         std::size_t diagonal,
-        std::size_t slot_count)
+        std::size_t baby_step)
     {
-        const std::size_t baby_step = baby_step_size(slot_count);
         return {
             diagonal % baby_step,
             diagonal - diagonal % baby_step,

@@ -2,6 +2,7 @@
 /build*/
 __pycache__/
 *.py[cod]
+/results/
 
 # CMake generated files
 CMakeCache.txt

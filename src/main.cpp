@@ -1,4 +1,5 @@
 #include <SEALTorch/sealtorch.h>
+#include "app/ciphertext_inference.h"
 
 #include <algorithm>
 #include <chrono>
@@ -181,6 +182,51 @@ static std::vector<double> read_tensor(const std::map<std::string, json::Value> 
     return result;
 }
 
+static std::size_t positive_size(
+    const json::Value &value, const std::string &field);
+
+static std::vector<std::size_t> tensor_shape(
+    const std::map<std::string, json::Value> &tensors,
+    const std::string &key)
+{
+    const json::Value &tensor = tensors.at(key);
+    if (!tensor.has("shape") || tensor.at("shape").kind != json::Value::Kind::array)
+        throw std::runtime_error("tensor is missing a shape: " + key);
+    std::vector<std::size_t> shape;
+    for (const json::Value &dimension : tensor.at("shape").array)
+        shape.push_back(positive_size(dimension, key + " shape"));
+    return shape;
+}
+
+static std::string take_tensor_prefix(
+    const std::map<std::string, json::Value> &tensors,
+    const std::vector<std::size_t> &expected_shape,
+    std::vector<std::string> &used_prefixes)
+{
+    std::vector<std::string> matches;
+    for (const auto &[key, _] : tensors) {
+        constexpr const char suffix[] = ".weight";
+        if (key.size() <= sizeof(suffix) - 1 || !key.ends_with(suffix))
+            continue;
+        const std::string prefix = key.substr(0, key.size() - (sizeof(suffix) - 1));
+        if (std::find(used_prefixes.begin(), used_prefixes.end(), prefix) !=
+            used_prefixes.end())
+            continue;
+        const auto bias = tensors.find(prefix + ".bias");
+        if (bias != tensors.end() && tensor_shape(tensors, key) == expected_shape &&
+            tensor_shape(tensors, bias->first) ==
+                std::vector<std::size_t>{expected_shape.front()})
+            matches.push_back(prefix);
+    }
+    if (matches.empty())
+        throw std::runtime_error("model artifact has no tensor matching a declared layer");
+    if (matches.size() != 1)
+        throw std::runtime_error(
+            "model artifact has ambiguous tensors for a declared layer; export explicit tensor keys");
+    used_prefixes.push_back(matches.front());
+    return matches.front();
+}
+
 static std::size_t positive_size(const json::Value &value, const std::string &field) {
     if (value.kind != json::Value::Kind::number || value.number <= 0 ||
         std::floor(value.number) != value.number)
@@ -205,10 +251,10 @@ static bool zero_pair(const json::Value &layer, const std::string &field) {
         value.array[1].kind == json::Value::Kind::number && value.array[1].number == 0;
 }
 
-static sealtorch::Activation activation_for(const std::string &op) {
-    if (op == "relu") return sealtorch::Activation::relu();
-    if (op == "gelu") return sealtorch::Activation::gelu();
-    if (op == "tanh") return sealtorch::Activation::tanh();
+static sealtorch::ActivationType activation_for(const std::string &op) {
+    if (op == "relu") return sealtorch::ActivationType::Relu;
+    if (op == "gelu") return sealtorch::ActivationType::Gelu;
+    if (op == "tanh") return sealtorch::ActivationType::Tanh;
     throw std::runtime_error("encrypted inference does not yet approximate trainer activation: " + op);
 }
 
@@ -318,14 +364,14 @@ static ModelArtifact load_model(const std::string &path) {
                 if (input_channels != channels) throw std::runtime_error("trainer convolution channel mismatch");
                 const std::size_t kernel = pair_value(layer, "kernel");
                 const std::size_t stride = pair_value(layer, "stride");
-                result.encrypted.add(sealtorch::Linear(lower_convolution(read_tensor(tensors, layer.at("weight_key").string), read_tensor(tensors, layer.at("bias_key").string), channels, height, width, outputs, kernel, kernel, stride)));
+                result.encrypted.add(lower_convolution(read_tensor(tensors, layer.at("weight_key").string), read_tensor(tensors, layer.at("bias_key").string), channels, height, width, outputs, kernel, kernel, stride));
                 height = (height - kernel) / stride + 1; width = (width - kernel) / stride + 1; channels = outputs;
                 widest = std::max(widest, channels * height * width);
             } else if (op == "avg_pool2d") {
                 if (!zero_pair(layer, "padding"))
                     throw std::runtime_error("encrypted trainer average pooling requires zero padding");
                 const std::size_t kernel = pair_value(layer, "kernel"), stride = pair_value(layer, "stride");
-                result.encrypted.add(sealtorch::Linear(lower_average_pool(channels, height, width, kernel, kernel, stride)));
+                result.encrypted.add(lower_average_pool(channels, height, width, kernel, kernel, stride));
                 height = (height - kernel) / stride + 1; width = (width - kernel) / stride + 1;
                 widest = std::max(widest, channels * height * width);
             } else if (op == "max_pool2d") {
@@ -343,7 +389,8 @@ static ModelArtifact load_model(const std::string &path) {
                 dense.weights.resize(output, std::vector<double>(input));
                 for (std::size_t row = 0; row < output; ++row)
                     std::copy_n(weights.begin() + row * input, input, dense.weights[row].begin());
-                result.encrypted.add(sealtorch::Linear(std::move(dense)));
+                result.encrypted.add(std::move(dense));
+                widest = std::max({widest, input, output});
             } else if (op == "tanh" || op == "relu" || op == "gelu" || op == "sigmoid" || op == "leaky_relu" || op == "elu" || op == "silu") {
                 result.encrypted.add(activation_for(op));
             } else {
@@ -355,11 +402,66 @@ static ModelArtifact load_model(const std::string &path) {
             result.minimum_ring_dimension *= 2;
         return result;
     }
-    throw std::runtime_error("only translated LeNet trainer exports are supported");
+    // Keep the original bundled JSON artifacts usable alongside trainer
+    // exports. They store tensors inline and describe layers with PyTorch
+    // type names rather than the trainer's operation names.
+    if (!root.has("model") || !root.has("tensors"))
+        throw std::runtime_error("unsupported model artifact");
+    result.cnn = true;
+    const auto &model = root.at("model");
+    const auto &shape = model.at("input_shape").array;
+    if (shape.size() != 3) throw std::runtime_error("native model must have CHW input_shape");
+    std::size_t channels = positive_size(shape[0], "input channels");
+    std::size_t height = positive_size(shape[1], "input height");
+    std::size_t width = positive_size(shape[2], "input width");
+    std::size_t widest = channels * height * width;
+    std::vector<std::string> used_prefixes;
+    for (const auto &layer : model.at("layers").array) {
+        const std::string type = layer.at("type").string;
+        if (type == "Flatten") continue;
+        if (type == "Conv2d") {
+            const std::size_t outputs = positive_size(layer.at("out_channels"), "out_channels");
+            const std::size_t inputs = positive_size(layer.at("in_channels"), "in_channels");
+            const std::size_t kernel = pair_value(layer, "kernel_size");
+            if (inputs != channels) throw std::runtime_error("native convolution channel mismatch");
+            const std::string prefix = take_tensor_prefix(
+                tensors, {outputs, inputs, kernel, kernel}, used_prefixes);
+            result.encrypted.add(lower_convolution(
+                read_tensor(tensors, prefix + ".weight"), read_tensor(tensors, prefix + ".bias"),
+                channels, height, width, outputs, kernel, kernel, 1));
+            height = height - kernel + 1; width = width - kernel + 1; channels = outputs;
+        } else if (type == "AvgPool2d") {
+            const std::size_t kernel = pair_value(layer, "kernel_size");
+            const std::size_t stride = layer.has("stride") ? pair_value(layer, "stride") : kernel;
+            result.encrypted.add(lower_average_pool(channels, height, width, kernel, kernel, stride));
+            height = (height - kernel) / stride + 1; width = (width - kernel) / stride + 1;
+        } else if (type == "Linear") {
+            const std::size_t input = positive_size(layer.at("in_features"), "in_features");
+            const std::size_t output = positive_size(layer.at("out_features"), "out_features");
+            const std::string prefix = take_tensor_prefix(
+                tensors, {output, input}, used_prefixes);
+            const auto weights = read_tensor(tensors, prefix + ".weight");
+            const auto biases = read_tensor(tensors, prefix + ".bias");
+            if (weights.size() != input * output || biases.size() != output)
+                throw std::runtime_error("invalid native linear tensor");
+            sealtorch::DenseLayer dense{checked_size(input, "linear input"), checked_size(output, "linear output"), {}, biases};
+            dense.weights.assign(output, std::vector<double>(input));
+            for (std::size_t row = 0; row < output; ++row)
+                std::copy_n(weights.begin() + row * input, input, dense.weights[row].begin());
+            result.encrypted.add(std::move(dense));
+            widest = std::max({widest, input, output});
+        } else if (type == "ReLU") result.encrypted.add(sealtorch::ActivationType::Relu);
+        else if (type == "Tanh") result.encrypted.add(sealtorch::ActivationType::Tanh);
+        else if (type.find("GELU") != std::string::npos) result.encrypted.add(sealtorch::ActivationType::Gelu);
+        else throw std::runtime_error("unsupported native model operation: " + type);
+        widest = std::max(widest, channels * height * width);
+    }
+    result.minimum_ring_dimension = 2;
+    while (result.minimum_ring_dimension / 2 < widest) result.minimum_ring_dimension *= 2;
+    return result;
 }
 
 struct RunConfig {
-    bool packed = true;
     std::size_t threads = 4;
     std::string device = "auto";
     int ring_dim = 16384;
@@ -396,7 +498,6 @@ static RunConfig parse_config(const json::Value &request)
 {
     const json::Value &value = request.has("config") ? request.at("config") : request;
     RunConfig config;
-    config.packed = string_or(value, "backend", "packed") != "scalar";
     config.device = string_or(
         value, "device", string_or(value, "plaintext_device", "auto"));
 
@@ -417,6 +518,11 @@ static RunConfig parse_config(const json::Value &request)
     if (config.depth < 1 || config.scaling_mod_bits < 1 ||
         config.first_mod_bits < 1 || config.scale_bits < 1)
         throw std::runtime_error("ciphertext bit sizes must be positive");
+    if (config.device != "cuda" &&
+        config.scale_bits != config.scaling_mod_bits)
+        throw std::runtime_error(
+            "SEAL CPU inference requires scale_bits to equal "
+            "scaling_mod_bits");
     if (config.device != "auto" &&
         config.device != "cpu" &&
         config.device != "cuda")
@@ -428,22 +534,21 @@ static RunConfig parse_config(const json::Value &request)
 static sealtorch::CiphertextInferenceOptions ciphertext_inference_options(
     const RunConfig &config)
 {
-    return {
+    sealtorch::CiphertextInferenceOptions options{
         config.device == "cpu"
             ? sealtorch::ExecutionTarget::Cpu
             : config.device == "cuda"
                 ? sealtorch::ExecutionTarget::Cuda
                 : sealtorch::ExecutionTarget::Auto,
-        config.packed
-            ? sealtorch::CiphertextLayout::Packed
-            : sealtorch::CiphertextLayout::Scalar,
         config.threads,
         static_cast<std::size_t>(config.ring_dim),
         static_cast<std::size_t>(config.depth),
         static_cast<std::size_t>(config.scaling_mod_bits),
         static_cast<std::size_t>(config.first_mod_bits),
-        static_cast<std::size_t>(config.scale_bits)
+        static_cast<std::size_t>(config.scale_bits),
+        0
     };
+    return options;
 }
 
 static std::size_t resident_memory_bytes()
@@ -489,7 +594,7 @@ static std::string model_path(const json::Value &request)
 {
     if (request.has("model_path"))
         return request.at("model_path").string;
-    throw std::runtime_error("a translated LeNet trainer model_path is required");
+    throw std::runtime_error("a model_path is required");
 }
 
 static std::vector<double> request_pixels(const json::Value &request)
@@ -505,12 +610,19 @@ static std::vector<double> request_pixels(const json::Value &request)
     return input;
 }
 
+static std::size_t activation_multiplicative_depth(
+    sealtorch::ActivationType type)
+{
+    if (type == sealtorch::ActivationType::Relu) return 0;
+    if (type == sealtorch::ActivationType::Tanh) return 3;
+    return 4;
+}
+
 static void print_result(
     const sealtorch::CiphertextInferenceResult &result,
     double setup_ms,
     std::size_t memory_before,
     std::size_t memory_after,
-    const RunConfig &config,
     bool used_cuda)
 {
     std::cout << "{\"encrypted\":";
@@ -536,7 +648,7 @@ static void print_result(
         << ",\"secret_key_bytes\":" << result.secret_key_bytes
         << ",\"relin_keys_bytes\":" << result.relin_keys_bytes
         << ",\"galois_keys_bytes\":" << result.galois_keys_bytes
-        << ",\"backend\":\"" << (config.packed ? "packed" : "scalar")
+        << ",\"backend\":\"packed\""
         << "\",\"device\":\"" << (used_cuda ? "cuda" : "cpu")
         << "\"}\n";
 }
@@ -566,17 +678,38 @@ static int run_web_worker()
                 sealtorch::CiphertextInferenceOptions options =
                     ciphertext_inference_options(config);
                 if (artifact.cnn) {
-                    // Seven linear transforms and four cubic tanh operations
-                    // consume 19 levels. Keep one additional level as margin.
-                    options.multiplicative_depth =
-                        std::max(options.multiplicative_depth, std::size_t{20});
+                    // Every lowered linear transform consumes one rescale and
+                    // Each fixed Taylor term consumes one rescale level.
+                    // Keep one unused level for final decryption precision.
+                    // Consuming the entire chain can make OpenFHE decoding
+                    // fail even when every requested operation fits.
+                    std::size_t required_depth = 1;
+                    for (const sealtorch::Operation &operation :
+                         artifact.encrypted.operations()) {
+                        if (operation.kind == sealtorch::OperationKind::Linear)
+                            ++required_depth;
+                        else if (operation.kind ==
+                                 sealtorch::OperationKind::Activation) {
+                            required_depth += activation_multiplicative_depth(
+                                operation.activation_type);
+                        }
+                    }
+                    if (options.multiplicative_depth < required_depth)
+                        throw std::runtime_error(
+                            "this model requires multiplicative depth " +
+                            std::to_string(required_depth) + "; configured depth is " +
+                            std::to_string(options.multiplicative_depth));
 
                     const std::size_t required_ring = artifact.minimum_ring_dimension ?
                         artifact.minimum_ring_dimension : std::size_t{8192};
                     if (options.ring_dimension < required_ring)
                         throw std::runtime_error(
                             "LeNet ciphertext inference needs a larger ring_dim for its widest feature map");
-                    options.ring_dimension = required_ring;
+                    // ``required_ring`` is a lower bound for the widest
+                    // lowered feature map, not a request to shrink a caller's
+                    // larger (and deeper) CKKS context.
+                    options.ring_dimension = std::max(
+                        options.ring_dimension, required_ring);
                 }
                 ciphertext_inference =
                     std::make_unique<sealtorch::CiphertextInference>(
@@ -599,8 +732,7 @@ static int run_web_worker()
                 sealtorch::ExecutionTarget::Cuda;
             const std::size_t memory_after = resident_memory_bytes();
             print_result(
-                encrypted, setup_ms, memory_before, memory_after,
-                config, used_cuda);
+                encrypted, setup_ms, memory_before, memory_after, used_cuda);
         } catch (const std::exception &error) {
             std::cout << "{\"error\":";
             print_json_string(error.what());
@@ -625,8 +757,19 @@ int main(int argc, char **argv)
                 << "}\n";
             return 0;
         }
+        if (argc == 3 && std::string(argv[1]) == "--validate-model") {
+            const ModelArtifact artifact = load_model(argv[2]);
+            std::cout
+                << "{\"input_size\":" << artifact.encrypted.input_size()
+                << ",\"output_size\":" << artifact.encrypted.output_size()
+                << ",\"operations\":"
+                << artifact.encrypted.operations().size()
+                << ",\"minimum_ring_dimension\":"
+                << artifact.minimum_ring_dimension << "}\n";
+            return 0;
+        }
         throw std::runtime_error(
-            "run webui/server.py, or use --web-worker");
+            "run webui/server.py, or use --web-worker/--validate-model");
     } catch (const std::exception &error) {
         std::cerr << "SEALTorch error: " << error.what() << '\n';
         return 1;

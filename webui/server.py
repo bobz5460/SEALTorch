@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 import urllib.request
+import urllib.parse
 from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,11 +38,18 @@ plaintext_models_lock = threading.Lock()
 benchmark_jobs = {}
 LENET_ROOT = pathlib.Path(os.environ.get(
     "SEALTORCH_LENET_ROOT", ROOT.parent / "LeNet-5"))
+NIST19_ROOT = pathlib.Path(os.environ.get(
+    "SEALTORCH_NIST19_ROOT", LENET_ROOT / "data" / "nist19" / "by_class"))
+NATIVE_MODELS = {
+    "relu": ROOT / "src" / "mnist_mlp.json",
+    "gelu": ROOT / "src" / "mnist_mlp_gelu.json",
+    "lenet": ROOT / "src" / "lenet.json",
+}
 
 
 def available_models():
     """Expose one choice per trainer export, never separate .pt/.json choices."""
-    models = {}
+    models = {name: path for name, path in NATIVE_MODELS.items() if path.is_file()}
     if LENET_ROOT.is_dir():
         for path in sorted(LENET_ROOT.glob("exports/**/*.pt")):
             models[f"trainer:{path.stem}"] = path
@@ -59,10 +67,81 @@ def is_trainer_model(name):
     return name.startswith("trainer:")
 
 
+def is_native_model(name):
+    return name in NATIVE_MODELS
+
+
+def native_manifest(name):
+    if not is_native_model(name):
+        raise ValueError("unknown native model")
+    return json.loads(model_file(name).read_text(encoding="utf-8"))
+
+
 def model_classes(name):
     if is_trainer_model(name):
         return load_export(model_file(name)).manifest.get("classes", [])
-    raise ValueError("only LeNet trainer exports are supported")
+    if is_native_model(name):
+        return native_manifest(name)["model"]["outputs"].get("classes", [])
+    raise ValueError("unknown model")
+
+
+def model_preprocessing(name):
+    if is_trainer_model(name):
+        return load_export(model_file(name)).manifest.get("preprocessing", {})
+    if is_native_model(name):
+        preprocessing = native_manifest(name).get("preprocessing", {})
+        return {"operations": [{
+            "op": "normalize_foreground",
+            "canvas_size": 28,
+            "foreground_size": preprocessing.get("resize_ink_to_max", [20])[0],
+            "threshold": preprocessing.get("crop_threshold", 20),
+        }]}
+    raise ValueError("unknown model")
+
+
+def model_minimum_ring_dimension(name):
+    """Return the smallest CKKS ring whose slot count fits every feature map."""
+    if is_trainer_model(name):
+        architecture = load_export(model_file(name)).manifest["architecture"]
+        _, channels, height, width = architecture["input"]["shape"]
+        layers = architecture["layers"]
+    elif is_native_model(name):
+        artifact = native_manifest(name)
+        channels, height, width = artifact["model"]["input_shape"]
+        layers = artifact["model"]["layers"]
+    else:
+        raise ValueError("unknown model")
+
+    def pair(value, default=None):
+        if value is None:
+            value = default
+        return (value, value) if isinstance(value, int) else tuple(value)
+
+    widest = channels * height * width
+    for layer in layers:
+        op = layer.get("op", layer.get("type", "")).lower()
+        if op == "conv2d":
+            kernel_h, kernel_w = pair(layer.get("kernel", layer.get("kernel_size")))
+            stride_h, stride_w = pair(layer.get("stride"), 1)
+            padding_h, padding_w = pair(layer.get("padding"), 0)
+            dilation_h, dilation_w = pair(layer.get("dilation"), 1)
+            height = (height + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
+            width = (width + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
+            channels = layer.get("out_channels", channels)
+        elif op in ("avg_pool2d", "avgpool2d", "max_pool2d", "maxpool2d"):
+            kernel_h, kernel_w = pair(layer.get("kernel", layer.get("kernel_size")))
+            stride_h, stride_w = pair(layer.get("stride"), (kernel_h, kernel_w))
+            padding_h, padding_w = pair(layer.get("padding"), 0)
+            height = (height + 2 * padding_h - kernel_h) // stride_h + 1
+            width = (width + 2 * padding_w - kernel_w) // stride_w + 1
+        elif op == "linear":
+            widest = max(widest, int(layer.get("in_features", 0)),
+                         int(layer.get("out_features", 0)))
+        widest = max(widest, channels * height * width)
+    ring = 2
+    while ring // 2 < widest:
+        ring *= 2
+    return ring
 
 
 def plaintext_model(name, device):
@@ -90,10 +169,44 @@ def plaintext_model(name, device):
                 plaintext_models.popitem(last=False)
             return model, True
 
-        raise ValueError("only LeNet trainer exports are supported")
+        if is_native_model(name):
+            artifact = native_manifest(name)
+            tensors, modules, weight_index = artifact["tensors"], [], 0
+            weight_keys = [key[:-7] for key in tensors if key.endswith(".weight")]
+            for layer in artifact["model"]["layers"]:
+                kind = layer["type"]
+                if kind == "Flatten":
+                    modules.append(torch.nn.Flatten())
+                elif kind == "Linear":
+                    prefix = weight_keys[weight_index]; weight_index += 1
+                    module = torch.nn.Linear(layer["in_features"], layer["out_features"])
+                    with torch.no_grad():
+                        module.weight.copy_(torch.tensor(tensors[prefix + ".weight"]["data"], dtype=torch.float32))
+                        module.bias.copy_(torch.tensor(tensors[prefix + ".bias"]["data"], dtype=torch.float32))
+                    modules.append(module)
+                elif kind == "Conv2d":
+                    prefix = weight_keys[weight_index]; weight_index += 1
+                    module = torch.nn.Conv2d(layer["in_channels"], layer["out_channels"], layer["kernel_size"])
+                    with torch.no_grad():
+                        module.weight.copy_(torch.tensor(tensors[prefix + ".weight"]["data"], dtype=torch.float32))
+                        module.bias.copy_(torch.tensor(tensors[prefix + ".bias"]["data"], dtype=torch.float32))
+                    modules.append(module)
+                elif kind == "AvgPool2d":
+                    modules.append(torch.nn.AvgPool2d(layer["kernel_size"], layer.get("stride", layer["kernel_size"])))
+                elif kind == "Tanh": modules.append(torch.nn.Tanh())
+                elif kind == "ReLU": modules.append(torch.nn.ReLU())
+                elif "GELU" in kind: modules.append(torch.nn.GELU())
+                else: raise ValueError(f"unsupported native model layer: {kind}")
+            model = torch.nn.Sequential(*modules).eval().to(device)
+            plaintext_models[cache_key] = model
+            while len(plaintext_models) > MAX_PLAINTEXT_MODELS:
+                plaintext_models.popitem(last=False)
+            return model, True
+
+        raise ValueError("unknown model")
 
 
-def run_plaintext(pixels, name, requested_device):
+def run_plaintext(pixels, name, requested_device, prepared_input=None):
     if requested_device not in ("auto", "cpu", "cuda"):
         raise ValueError("device must be auto, cpu, or cuda")
     if requested_device == "cuda" and not torch.cuda.is_available():
@@ -105,11 +218,11 @@ def run_plaintext(pixels, name, requested_device):
     device = "cuda" if use_cuda else "cpu"
     setup_started = time.perf_counter()
     model, initialized = plaintext_model(name, device)
-    value = torch.tensor(pixels, dtype=torch.float32, device=device)
-    if is_trainer_model(name):
-        value = prepare_trainer_pixels(pixels, name, device)
-    else:
-        raise ValueError("only LeNet trainer exports are supported")
+    if not (is_trainer_model(name) or is_native_model(name)):
+        raise ValueError("unknown model")
+    value = (prepared_input.to(device) if prepared_input is not None else
+             prepare_trainer_pixels(pixels, name, device) if is_trainer_model(name)
+             else prepare_native_pixels(pixels, device))
 
     # CUDA may defer allocation and kernel/module loading until the first
     # invocation.  Warm a newly cached model before starting the inference
@@ -128,10 +241,13 @@ def run_plaintext(pixels, name, requested_device):
     return output.reshape(-1).cpu().double().tolist(), (time.perf_counter() - started) * 1000, device, setup_ms
 
 
-def prepare_trainer_pixels(pixels, name, device="cpu"):
-    """Apply an export's web-input operations to an upright dashboard drawing."""
+def prepare_trainer_image(image, name, device="cpu"):
+    """Apply an export's operations to a single-channel upright image tensor."""
     export = load_export(model_file(name))
-    image = torch.tensor(pixels, dtype=torch.float32, device=device).reshape(1, 28, 28)
+    image = torch.as_tensor(image, dtype=torch.float32, device=device)
+    if image.ndim != 2:
+        raise ValueError("trainer input image must be two-dimensional")
+    image = image.unsqueeze(0)
     operations = export.manifest.get("preprocessing", {}).get("operations", [])
     # Early EMNIST exports predate ``apply_to`` and describe both a transpose
     # and horizontal flip for their sideways source files.  A browser canvas is
@@ -151,14 +267,82 @@ def prepare_trainer_pixels(pixels, name, device="cpu"):
             continue
         if kind == "transpose": image = image.transpose(-2, -1)
         elif kind == "flip_horizontal": image = image.flip(-1)
+        elif kind == "normalize_foreground":
+            image = normalize_foreground(
+                image,
+                canvas_size=operation.get("canvas_size", 28),
+                foreground_size=operation.get("foreground_size", 20),
+                threshold=operation.get("threshold", 20),
+            )
         elif kind == "pad":
-            image = torch.nn.functional.pad(image, (operation["left"], operation["right"], operation["top"], operation["bottom"]), value=operation.get("fill", 0))
+            image = torch.nn.functional.pad(
+                image, (operation["left"], operation["right"], operation["top"], operation["bottom"]),
+                value=operation.get("fill", 0))
+        elif kind == "resize":
+            image = torch.nn.functional.interpolate(
+                image.unsqueeze(0), size=tuple(operation["size"]),
+                mode="bilinear", align_corners=False).squeeze(0)
+        elif kind == "to_tensor":
+            continue
         elif kind == "normalize":
-            image = (image - operation["mean"][0]) / operation["std"][0]
-        elif kind in ("resize", "to_tensor"): pass  # the canvas is already 28×28 float CHW
+            return ((image - operation["mean"][0]) / operation["std"][0]).unsqueeze(0)
         elif kind == "invert": image = 1.0 - image
         else: raise ValueError(f"unsupported trainer preprocessing operation: {kind}")
-    return image.unsqueeze(0)
+    raise ValueError("trainer preprocessing must end with normalize")
+
+
+def prepare_trainer_pixels(pixels, name, device="cpu"):
+    """Apply an export's web-input operations to an upright 28×28 drawing."""
+    return prepare_trainer_image(
+        torch.tensor(pixels, dtype=torch.float32).reshape(28, 28), name, device)
+
+
+def prepare_native_pixels(pixels, device="cpu"):
+    """Match the bundled MNIST artifacts' crop, scale, and NCHW layout."""
+    image = torch.tensor(pixels, dtype=torch.float32, device=device).reshape(1, 28, 28)
+    return normalize_foreground(image).unsqueeze(0)
+
+
+def prepare_native_validation_pixels(pixels, device="cpu"):
+    """Prepare already-normalized MNIST validation images without re-cropping.
+
+    Foreground centering is a canvas adaptation for hand drawings. Applying it
+    again to canonical MNIST test images changes the dataset on which the
+    bundled checkpoints report their accuracy.
+    """
+    return torch.as_tensor(
+        pixels, dtype=torch.float32, device=device).reshape(1, 1, 28, 28) / 255.0
+
+
+def prepare_validation_input(pixels, name, device="cpu"):
+    """Prepare a raw validation sample, preserving its source image geometry."""
+    if isinstance(pixels, torch.Tensor):
+        return prepare_trainer_image(pixels, name, device)
+    if is_trainer_model(name):
+        return prepare_trainer_pixels([value / 255.0 for value in pixels], name, device)
+    return prepare_native_validation_pixels(pixels, device)
+
+
+def normalize_foreground(image, *, canvas_size=28, foreground_size=20, threshold=20):
+    """Match the trainer's MNIST-style crop, scale, and centering operation."""
+    if not 0 < foreground_size <= canvas_size:
+        raise ValueError("foreground_size must be in (0, canvas_size]")
+    coordinates = torch.nonzero(image[0] > threshold / 255.0, as_tuple=False)
+    if not len(coordinates):
+        return torch.zeros((1, canvas_size, canvas_size), dtype=image.dtype, device=image.device)
+    top, left = coordinates.min(dim=0).values.tolist()
+    bottom, right = coordinates.max(dim=0).values.tolist()
+    glyph = image[:, top:bottom + 1, left:right + 1]
+    height, width = glyph.shape[-2:]
+    scale = foreground_size / max(width, height)
+    resized = torch.nn.functional.interpolate(
+        glyph.unsqueeze(0), size=(max(1, round(height * scale)), max(1, round(width * scale))),
+        mode="bilinear", align_corners=False).squeeze(0)
+    result = torch.zeros((1, canvas_size, canvas_size), dtype=image.dtype, device=image.device)
+    y = (canvas_size - resized.shape[-2]) // 2
+    x = (canvas_size - resized.shape[-1]) // 2
+    result[:, y:y + resized.shape[-2], x:x + resized.shape[-1]] = resized
+    return result
 
 
 class HEWorker:
@@ -397,12 +581,23 @@ def execute(request, collect_telemetry=True):
     model = request.get("model", "trainer:lenet5_mnist")
     if engine not in ("he", "pytorch"):
         raise ValueError("engine must be he or pytorch")
-    validate_pixels(request.get("pixels"))
+    if not (is_trainer_model(model) or is_native_model(model)):
+        raise ValueError("unknown model")
+    # Prepare once, before selecting an engine. This makes the export manifest
+    # the single preprocessing contract for every model and every execution
+    # route (single run, comparison, HE, and benchmark).
+    prepared_input = request.get("_prepared_input")
+    if prepared_input is None:
+        validate_pixels(request.get("pixels"))
+        prepared_input = (prepare_trainer_pixels(request["pixels"], model)
+                          if is_trainer_model(model)
+                          else prepare_native_pixels(request["pixels"]))
     before = telemetry_snapshot() if collect_telemetry else None
     started = time.monotonic()
     if engine == "pytorch":
         output, runtime_ms, device, setup_ms = run_plaintext(
-            request["pixels"], model, config.get("device", "auto"))
+            request["pixels"], model, config.get("device", "auto"),
+            prepared_input=prepared_input)
         result = {
             "engine": "pytorch", "device": device, "output": output,
             "execution_ms": runtime_ms, "plain_ms": runtime_ms,
@@ -411,10 +606,13 @@ def execute(request, collect_telemetry=True):
     else:
         binary = select_he_backend(config.get("device", "auto"))
         worker_request = dict(request)
-        if is_trainer_model(model):
-            export = load_export(model_file(model))
-            worker_request["pixels"] = prepare_trainer_pixels(request["pixels"], model).reshape(-1).tolist()
-            worker_request["model_path"] = str(native_artifact(export))
+        # ``_prepared_input`` is an in-process tensor used by benchmarks with
+        # non-28×28 sources (not part of the native worker protocol).
+        worker_request.pop("_prepared_input", None)
+        worker_request["pixels"] = prepared_input.reshape(-1).tolist()
+        worker_request["model_path"] = str(
+            native_artifact(load_export(model_file(model)))
+            if is_trainer_model(model) else model_file(model))
         result = he_worker.run(worker_request, binary)
         if "error" not in result:
             result["engine"] = "he"
@@ -497,6 +695,81 @@ def mnist_validation_set():
         "under data/MNIST/raw/")
 
 
+class ValidationDataset:
+    """A validation split whose source pixels can be read without preprocessing."""
+    def __init__(self, dataset, labels, classes, pixels_at, location):
+        self.dataset = dataset
+        self.labels = labels
+        self.classes = classes
+        self.pixels_at = pixels_at
+        self.location = location
+
+    def status(self):
+        counts = [0] * len(self.classes)
+        for label in self.labels:
+            if 0 <= label < len(counts):
+                counts[label] += 1
+        return {"loaded": True, "dataset": self.dataset, "samples": len(self.labels),
+                "classes": self.classes, "label_counts": counts,
+                "location": self.location}
+
+
+def trainer_validation_set(name):
+    """Return the selected export's validation split in upright source orientation."""
+    if is_native_model(name):
+        images, labels = mnist_validation_set()
+        return ValidationDataset("mnist", labels, model_classes(name), lambda index: images[index],
+                                 str(MNIST_DIR.relative_to(ROOT)))
+    export = load_export(model_file(name))
+    dataset = export.manifest.get("dataset", "")
+    classes = export.manifest.get("classes", [])
+    if dataset == "mnist":
+        images, labels = mnist_validation_set()
+        return ValidationDataset(dataset, labels, classes, lambda index: images[index],
+                                 str(MNIST_DIR.relative_to(ROOT)))
+
+    if dataset.startswith("emnist-"):
+        root = LENET_ROOT / "data" / "EMNIST" / "raw"
+        stem = f"{dataset}-test"
+        image = root / f"{stem}-images-idx3-ubyte"
+        label = root / f"{stem}-labels-idx1-ubyte"
+        if not image.exists() or not label.exists():
+            raise FileNotFoundError(
+                f"{dataset} test IDX files were not found under {root}")
+        images, labels = read_idx(image, 2051), read_idx(label, 2049)
+        # EMNIST stores each glyph transposed.  Its manifest marks this transform
+        # as dataset-only, whereas browser-like input must already be upright.
+        def pixels_at(index):
+            glyph = images[index]
+            return [glyph[row + column * 28] for row in range(28) for column in range(28)]
+        return ValidationDataset(dataset, labels, classes, pixels_at,
+                                 str(root.relative_to(ROOT.parent)))
+
+    if dataset == "nist19":
+        source = str(LENET_ROOT)
+        if source not in sys.path:
+            sys.path.insert(0, source)
+        from data import NIST19Letters
+        root = NIST19_ROOT
+        full = NIST19Letters(root, transform=None)
+        training = export.manifest.get("training", {})
+        fraction = float(training.get("val_fraction", 0.1))
+        seed = int(training.get("seed", 42))
+        validation_count = max(1, round(len(full) * fraction))
+        order = torch.randperm(len(full), generator=torch.Generator().manual_seed(seed)).tolist()
+        indices = order[len(full) - validation_count:]
+        labels = [full.samples[index][1] for index in indices]
+        def pixels_at(index):
+            image, _ = full.raw_item(indices[index])
+            # The trainer's foreground operation accepts raw NIST scan sizes.
+            return torch.tensor(list(image.getdata()), dtype=torch.float32).reshape(
+                image.height, image.width) / 255.0
+        return ValidationDataset(dataset, labels, classes, pixels_at,
+                                 str(root.relative_to(ROOT.parent)))
+
+    raise ValueError(f"benchmarking is not implemented for trainer dataset {dataset!r}")
+
+
 def mnist_data_status():
     try:
         images, labels = mnist_validation_set()
@@ -511,6 +784,15 @@ def mnist_data_status():
             "error": str(error),
             "location": str(MNIST_DIR.relative_to(ROOT)),
         }
+
+
+def trainer_data_status(name):
+    try:
+        return trainer_validation_set(name).status()
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
+        dataset = "mnist" if is_native_model(name) else load_export(model_file(name)).manifest.get("dataset", "")
+        return {"loaded": False, "dataset": dataset,
+                "error": str(error)}
 
 
 def download_mnist():
@@ -543,10 +825,14 @@ def benchmark_runner(
         batch_size,
         start_index=0,
         stride=1,
-        shuffle_seed=None):
+    shuffle_seed=None):
     job = benchmark_jobs[job_id]
     try:
-        images, labels = mnist_validation_set()
+        name = config.get("model", "trainer:lenet5_mnist")
+        dataset = trainer_validation_set(name)
+        labels, classes = dataset.labels, dataset.classes
+        if not classes:
+            raise ValueError("trainer export must declare its benchmark classes")
         indices = list(range(max(0, start_index), len(labels), max(1, stride)))
         if shuffle_seed is not None:
             import random
@@ -555,24 +841,31 @@ def benchmark_runner(
         indices = indices[:count]
         job.update({"status": "running", "total": count, "completed": 0})
         latencies, setup_times, correct, predictions = [], [], 0, []
-        confusion = [[0] * 10 for _ in range(10)]
+        confusion = [[0] * len(classes) for _ in classes]
         power_before, benchmark_started = telemetry_snapshot(), time.monotonic()
         for begin in range(0, count, batch_size):
             for index in range(begin, min(begin + batch_size, count)):
                 dataset_index = indices[index]
-                pixels = [value / 255.0 for value in images[dataset_index]]
+                pixels = dataset.pixels_at(dataset_index)
+                if isinstance(pixels, torch.Tensor):
+                    prepared_input = prepare_validation_input(pixels, name)
+                    pixels = pixels.reshape(-1).tolist() if pixels.numel() == 784 else [0.0] * 784
+                else:
+                    prepared_input = prepare_validation_input(pixels, name)
+                    pixels = [value / 255.0 for value in pixels]
                 result = execute(
                     {
                         "pixels": pixels,
-                        "model": config.get("model", "trainer:lenet5_mnist"),
+                        "model": name,
                         "config": config,
+                        "_prepared_input": prepared_input,
                     },
                     collect_telemetry=False,
                 )
                 if "error" in result:
                     raise RuntimeError(result["error"])
                 prediction = max(
-                    range(10),
+                    range(len(classes)),
                     key=lambda item: result["output"][item],
                 )
                 label = labels[dataset_index]
@@ -615,11 +908,11 @@ def benchmark_runner(
             latency_stddev = variance ** 0.5
         else:
             latency_stddev = 0
-        per_digit_accuracy = [
-            confusion[digit][digit] / label_totals[digit]
-            if label_totals[digit]
+        per_class_accuracy = [
+            confusion[class_index][class_index] / label_totals[class_index]
+            if label_totals[class_index]
             else None
-            for digit in range(10)
+            for class_index in range(len(classes))
         ]
         initialization_events = sum(
             1 for setup_ms in setup_times if setup_ms > 0)
@@ -628,6 +921,8 @@ def benchmark_runner(
             "created_at": job["created_at"],
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "config": config,
+            "dataset": dataset.dataset,
+            "classes": classes,
             "samples": count,
             "batch_size": batch_size,
             "selection": {
@@ -649,7 +944,7 @@ def benchmark_runner(
             "initialization_events": initialization_events,
             "throughput_per_s": count / elapsed if elapsed else 0,
             "confusion_matrix": confusion,
-            "per_digit_accuracy": per_digit_accuracy,
+            "per_class_accuracy": per_class_accuracy,
             "latency_ms": latencies,
             "setup_ms": setup_times,
             "predictions": predictions,
@@ -657,7 +952,7 @@ def benchmark_runner(
                 power_before, telemetry_snapshot(), elapsed),
         }
         RESULTS_DIR.mkdir(exist_ok=True)
-        destination = RESULTS_DIR / f"mnist-benchmark-{job_id}.json"
+        destination = RESULTS_DIR / f"{dataset.dataset}-benchmark-{job_id}.json"
         destination.write_text(json.dumps(summary, indent=2))
         job.update({
             "status": "complete",
@@ -705,7 +1000,7 @@ def start_benchmark(
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, value, status=200):
-        data = json.dumps(value).encode("utf-8")
+        data = json.dumps(value, allow_nan=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -713,6 +1008,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        path = urllib.parse.urlparse(self.path)
         if self.path == "/api/health":
             capabilities = he_capabilities()
             self.send_json({
@@ -720,24 +1016,31 @@ class Handler(BaseHTTPRequestHandler):
                 "he_backends": capabilities,
             })
             return
-        if self.path == "/api/mnist/data":
+        if path.path == "/api/mnist/data":
             self.send_json(mnist_data_status())
             return
-        if self.path == "/api/models":
+        if path.path == "/api/dataset/status":
+            name = urllib.parse.parse_qs(path.query).get("model", ["trainer:lenet5_mnist"])[0]
+            self.send_json(trainer_data_status(name))
+            return
+        if path.path == "/api/models":
             self.send_json({
-                "models": [{"id": name, "label": name.replace("trainer:", "LeNet trainer: "),
-                            "classes": model_classes(name)}
+                "models": [{"id": name, "label": (name.replace("trainer:", "LeNet trainer: ")
+                                                      if is_trainer_model(name) else f"Bundled native: {name}"),
+                            "classes": model_classes(name),
+                            "preprocessing": model_preprocessing(name),
+                            "minimum_ring_dimension": model_minimum_ring_dimension(name)}
                            for name in available_models()],
             })
             return
-        if self.path.startswith("/api/benchmark/"):
-            job_id = self.path.rsplit("/", 1)[-1]
+        if path.path.startswith("/api/benchmark/"):
+            job_id = path.path.rsplit("/", 1)[-1]
             if job_id not in benchmark_jobs:
                 self.send_json({"error": "benchmark not found"}, 404)
             else:
                 self.send_json(benchmark_jobs[job_id])
             return
-        if self.path not in ("/", "/index.html"):
+        if path.path not in ("/", "/index.html"):
             self.send_error(404)
             return
         data = (ROOT / "webui" / "index.html").read_bytes()

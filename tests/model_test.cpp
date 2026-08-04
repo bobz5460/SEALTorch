@@ -1,8 +1,8 @@
 #include <SEALTorch/model.h>
+#include <SEALTorch/math.h>
 #include <SEALTorch/packing.h>
 
 #include <cassert>
-#include <stdexcept>
 #include <vector>
 
 namespace
@@ -27,10 +27,10 @@ namespace
         assert((diagonals == std::vector<std::size_t>{0, 1}));
         assert(sealtorch::signed_rotation(0, 8) == 0);
         assert(sealtorch::signed_rotation(7, 8) == -1);
-        assert(sealtorch::baby_step_size(8) == 3);
+        assert(sealtorch::baby_step_size(8, diagonals.size()) == 2);
 
         const sealtorch::DiagonalSplit split =
-            sealtorch::split_diagonal(7, 8);
+            sealtorch::split_diagonal(7, 2);
         assert(split.baby == 1);
         assert(split.giant == 6);
         assert((split.baby + split.giant) % 8 == 7);
@@ -48,25 +48,23 @@ namespace
     void test_sequential_model()
     {
         sealtorch::Sequential model;
-        model.add(sealtorch::Linear(small_layer()));
-        model.add(sealtorch::Activation::relu());
+        model.add(small_layer());
+        model.add(sealtorch::ActivationType::Relu);
         assert(model.input_size() == 3);
         assert(model.output_size() == 2);
-        assert(model.has_activation(0));
-        assert(model.activation(0) == sealtorch::ActivationType::Relu);
+        assert(model.operations().size() == 2);
     }
 
-    void test_invalid_dimensions()
+    void test_fixed_taylor_series()
     {
-        sealtorch::DenseLayer layer = small_layer();
-        layer.biases.pop_back();
-        bool rejected = false;
-        try {
-            sealtorch::Sequential().add(sealtorch::Linear(layer));
-        } catch (const std::runtime_error &) {
-            rejected = true;
-        }
-        assert(rejected);
+        assert((sealtorch::activation_taylor_coefficients(
+                    sealtorch::ActivationType::Relu) ==
+                std::vector<double>{0.0, 1.0}));
+        assert((sealtorch::activation_taylor_coefficients(
+                    sealtorch::ActivationType::Tanh) ==
+                std::vector<double>{0.0, 1.0, 0.0, -1.0 / 3.0}));
+        assert(sealtorch::activation_taylor_coefficients(
+                   sealtorch::ActivationType::Gelu).size() == 5);
     }
 }
 
@@ -75,5 +73,5 @@ int main()
     test_sparse_diagonals();
     test_zero_layer();
     test_sequential_model();
-    test_invalid_dimensions();
+    test_fixed_taylor_series();
 }

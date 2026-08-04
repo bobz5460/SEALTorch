@@ -1,6 +1,7 @@
 #pragma once
 
 #include <seal/seal.h>
+#include <SEALTorch/model.h>
 
 #include <cstddef>
 #include <vector>
@@ -8,6 +9,14 @@
 namespace sealtorch
 {
     class ThreadPool;
+
+    // Fixed, zero-centered Taylor coefficients for the supported activation.
+    std::vector<double> activation_taylor_coefficients(ActivationType type);
+
+    seal::Ciphertext approximate_activation(
+        const seal::Evaluator& evaluator, const seal::RelinKeys& relin_keys,
+        seal::CKKSEncoder& encoder, const seal::Ciphertext& input,
+        double scale, ActivationType type);
 
     struct EncodedDiagonal
     {
@@ -27,13 +36,6 @@ namespace sealtorch
         std::vector<EncodedDiagonalGroup> groups;
     };
 
-    seal::Ciphertext encrypted_dot_product(
-        const seal::Evaluator &evaluator,
-        const seal::GaloisKeys &galois_keys,
-        const seal::Plaintext &weights,
-        const seal::Ciphertext &input,
-        std::size_t input_width);
-
     // Computes all rows of weights * input in one packed ciphertext.
     // Input and output values use the first slots.
     seal::Ciphertext encrypted_matrix_vector_product(
@@ -44,43 +46,5 @@ namespace sealtorch
         const EncodedMatrix& matrix,
         std::size_t thread_count,
         ThreadPool &thread_pool);
-
-    // Degree-four polynomial approximation of ReLU, range-normalized for
-    // the exported MNIST MLP's approximately [-10, 10] activations.
-    //
-    //   ReLU(x) ~= 0.33810450 + 0.5*x + 0.096514968*x^2
-    //              - 0.00053277056*x^4
-    //
-    // The ciphertext must have at least three rescaling levels available,
-    // and the caller's scale should match the scale used to encrypt input.
-    seal::Ciphertext approximate_relu(
-        const seal::Evaluator& evaluator,
-        const seal::RelinKeys& relin_keys,
-        seal::CKKSEncoder& encoder,
-        const seal::Ciphertext& input,
-        double scale);
-
-    // Degree-four polynomial approximation of GELU. Accuracy is best when
-    // values entering the activation are mostly in [-2, 2].
-    //
-    //   GELU(x) ~= 0.5*x + 0.39894228*x^2 - 0.06649038*x^4
-    //
-    // The ciphertext
-    // must have at least three rescaling levels available, and the caller's
-    // scale should match the scale used to encrypt input.
-    seal::Ciphertext approximate_gelu(
-        const seal::Evaluator& evaluator,
-        const seal::RelinKeys& relin_keys,
-        seal::CKKSEncoder& encoder,
-        const seal::Ciphertext& input,
-        double scale);
-
-    // Odd degree-three fit of tanh on LeNet's usual activation range.
-    seal::Ciphertext approximate_tanh(
-        const seal::Evaluator& evaluator,
-        const seal::RelinKeys& relin_keys,
-        seal::CKKSEncoder& encoder,
-        const seal::Ciphertext& input,
-        double scale);
 
 }

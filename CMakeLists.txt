@@ -16,20 +16,17 @@ endif()
 
 if(fideslib_FOUND)
     find_package(OpenMP REQUIRED)
-    set(SEALTORCH_CUDA_SOURCE src/SEALTorch/cuda_ciphertext_inference.cpp)
+    set(SEALTORCH_CUDA_SOURCE src/app/cuda_ciphertext_inference.cpp)
     message(STATUS "SEALTorch CUDA provider enabled")
 else()
-    set(SEALTORCH_CUDA_SOURCE src/SEALTorch/cuda_ciphertext_inference_stub.cpp)
+    set(SEALTORCH_CUDA_SOURCE src/app/cuda_ciphertext_inference_stub.cpp)
     message(STATUS "SEALTorch CUDA provider disabled (FIDESlib not found)")
 endif()
 
 add_library(SEALTorch STATIC
     src/SEALTorch/math.cpp
     src/SEALTorch/evaluator.cpp
-    src/SEALTorch/metrics.cpp
-    src/SEALTorch/seal_ciphertext_backend.cpp
-    src/SEALTorch/ciphertext_inference.cpp
-    ${SEALTORCH_CUDA_SOURCE})
+    src/SEALTorch/seal_ciphertext_backend.cpp)
 add_library(SEALTorch::SEALTorch ALIAS SEALTorch)
 
 target_compile_features(SEALTorch PUBLIC cxx_std_20)
@@ -37,20 +34,22 @@ target_include_directories(SEALTorch PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(SEALTorch PUBLIC SEAL::seal)
-if(fideslib_FOUND)
-    target_link_libraries(SEALTorch PRIVATE
-        fideslib::fideslib
-        OpenMP::OpenMP_CXX)
-endif()
-
 option(SEALTORCH_WARNINGS "Enable helpful compiler warnings" ON)
 if(SEALTORCH_WARNINGS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(SEALTorch PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(sealtorch_gui src/main.cpp)
+add_executable(sealtorch_gui
+    src/main.cpp
+    src/app/ciphertext_inference.cpp
+    ${SEALTORCH_CUDA_SOURCE})
 target_compile_features(sealtorch_gui PRIVATE cxx_std_20)
 target_link_libraries(sealtorch_gui PRIVATE SEALTorch)
+if(fideslib_FOUND)
+    target_link_libraries(sealtorch_gui PRIVATE
+        fideslib::fideslib
+        OpenMP::OpenMP_CXX)
+endif()
 if(SEALTORCH_WARNINGS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(sealtorch_gui PRIVATE -Wall -Wextra -Wpedantic)
 endif()

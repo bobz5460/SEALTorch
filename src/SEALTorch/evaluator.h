@@ -17,14 +17,6 @@ namespace sealtorch
 
         const Sequential &model() const;
 
-        std::vector<seal::Ciphertext> linear_scalar(
-            const std::vector<seal::Ciphertext> &input,
-            const DenseLayer &layer,
-            const seal::Evaluator &evaluator,
-            const seal::GaloisKeys &galois_keys,
-            seal::CKKSEncoder &encoder,
-            double scale) const;
-
         seal::Ciphertext linear_packed(
             const seal::SEALContext &context,
             const seal::Ciphertext &input,
@@ -36,13 +28,12 @@ namespace sealtorch
             double scale,
             std::size_t thread_count) const;
 
-        std::vector<seal::Ciphertext> activation(
-            const std::vector<seal::Ciphertext> &input,
+        seal::Ciphertext activation(
+            const seal::Ciphertext &input,
             ActivationType type,
             const seal::SEALContext &context,
             const seal::RelinKeys &relin_keys,
-            double scale,
-            std::size_t thread_count) const;
+            double scale) const;
 
     private:
         Sequential model_;

@@ -1,4 +1,3 @@
-import gzip
 import importlib.util
 import math
 import pathlib
@@ -14,28 +13,12 @@ SPEC.loader.exec_module(server)
 
 
 class ServerTests(unittest.TestCase):
-    def test_percentile_interpolates(self):
-        self.assertEqual(server.percentile([1, 2, 3], 0.5), 2)
-        self.assertEqual(server.percentile([], 0.5), 0)
-
     def test_validate_pixels(self):
         server.validate_pixels([0.5] * 784)
         with self.assertRaises(ValueError):
             server.validate_pixels([0.5] * 783)
         with self.assertRaises(ValueError):
             server.validate_pixels([2.0] * 784)
-
-    def test_read_idx_rejects_truncated_images(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = pathlib.Path(directory) / "images.gz"
-            with gzip.open(path, "wb") as output:
-                output.write((2051).to_bytes(4, "big"))
-                output.write((1).to_bytes(4, "big"))
-                output.write((28).to_bytes(4, "big"))
-                output.write((28).to_bytes(4, "big"))
-                output.write(b"\0" * 10)
-            with self.assertRaises(ValueError):
-                server.read_idx(path, 2051)
 
     def test_trainer_model_produces_exported_number_of_outputs(self):
         pixels = [0.0] * 784
@@ -45,20 +28,45 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(len(output), 10)
         self.assertTrue(all(math.isfinite(value) for value in output))
 
-    def test_emnist_web_input_skips_dataset_orientation_correction(self):
+    def test_emnist_web_input_skips_dataset_orientation_and_centers_ink(self):
         pixels = [0.0] * 784
         row, column = 3, 17
         pixels[row * 28 + column] = 1.0
 
         image = server.prepare_trainer_pixels(
-            pixels, "trainer:lenet5_emnist-byclass")
+            pixels, "trainer:emnist-lenet5-gelu")
 
-        # The export adds a two-pixel border after the dataset-only transpose.
-        # If that transpose reached the canvas input, the ink would instead
-        # appear at (17, 3).
+        # Dataset-only orientation correction must not rotate browser drawings.
+        # The trainer's foreground-normalization operation then puts the glyph
+        # into the centered 20×20 MNIST content box, before its two-pixel pad.
         self.assertEqual(image.shape, (1, 1, 32, 32))
-        self.assertGreater(float(image[0, 0, row + 2, column + 2]), 0)
-        self.assertLessEqual(float(image[0, 0, column + 2, row + 2]), 0)
+        center = 2 + (28 - 20) // 2 + 10
+        self.assertGreater(float(image[0, 0, center, center]), 0)
+        self.assertLessEqual(float(image[0, 0, row + 2, column + 2]), 0)
+
+    def test_benchmark_uses_selected_model_dataset_and_class_count(self):
+        job_id = "emnist-test"
+        server.benchmark_jobs[job_id] = {
+            "id": job_id,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            old_results = server.RESULTS_DIR
+            try:
+                server.RESULTS_DIR = pathlib.Path(directory)
+                server.benchmark_runner(
+                    job_id,
+                    {"model": "trainer:emnist-lenet5-gelu", "engine": "pytorch", "device": "cpu"},
+                    limit=1,
+                    batch_size=1,
+                )
+            finally:
+                server.RESULTS_DIR = old_results
+        result = server.benchmark_jobs.pop(job_id)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["dataset"], "emnist-byclass")
+        self.assertEqual(len(result["classes"]), 62)
+        self.assertEqual(len(result["confusion_matrix"]), 62)
 
 
 if __name__ == "__main__":

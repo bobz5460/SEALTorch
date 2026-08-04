@@ -45,31 +45,6 @@ namespace sealtorch
         }
 
         template <typename Function>
-        void parallel_for(std::size_t count, std::size_t requested, Function function)
-        {
-            if (count == 0) return;
-            ensure_thread_count(std::min(count, std::max<std::size_t>(1, requested)));
-            const std::size_t jobs = std::min({count, std::max<std::size_t>(1, requested), workers_.size()});
-            std::vector<std::future<void>> futures;
-            futures.reserve(jobs);
-            for (std::size_t job = 0; job < jobs; ++job)
-            {
-                std::packaged_task<void()> task([&, job, jobs] {
-                    for (std::size_t index = job; index < count; index += jobs)
-                        function(index);
-                });
-                futures.push_back(task.get_future());
-                auto task_ptr = std::make_shared<std::packaged_task<void()>>(std::move(task));
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    queue_.emplace([task_ptr] { (*task_ptr)(); });
-                }
-                condition_.notify_one();
-            }
-            for (std::future<void> &future : futures) future.get();
-        }
-
-        template <typename Function>
         void parallel_for_workers(std::size_t count, std::size_t requested, Function function)
         {
             if (count == 0) return;

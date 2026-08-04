@@ -23,6 +23,10 @@ class LeNetExport:
     source: Path
     manifest: dict[str, Any]
     state_dict: dict[str, torch.Tensor]
+    # A trainer may export topology and weights separately.  Keep both paths
+    # so the cache is invalidated when either half changes.
+    manifest_source: Path
+    weights_source: Path
 
 
 def load_export(path: str | Path) -> LeNetExport:
@@ -30,31 +34,74 @@ def load_export(path: str | Path) -> LeNetExport:
     source = Path(path).expanduser().resolve()
     if source.suffix == ".pt":
         bundle = torch.load(source, map_location="cpu", weights_only=False)
-        manifest = {key: value for key, value in bundle.items() if key != "state_dict"}
-        state = bundle.get("state_dict")
+        # Checkpoints have historically contained only model_state_dict.  When
+        # the trainer also supplies a JSON export, that manifest is the graph
+        # authority: it records the exact operation sequence and parameters
+        # used for inference.  Never let incidental checkpoint metadata
+        # override it.
+        paired_manifest = source.with_suffix(".json")
+        if paired_manifest.is_file():
+            manifest = json.loads(paired_manifest.read_text(encoding="utf-8"))
+            manifest_source = paired_manifest
+        else:
+            manifest = {key: value for key, value in bundle.items()
+                        if key not in ("state_dict", "model_state_dict")}
+            manifest_source = source
+        state = bundle.get("state_dict", bundle.get("model_state_dict"))
+        weights_source = source
     elif source.suffix == ".json":
         import numpy as np
         manifest = json.loads(source.read_text(encoding="utf-8"))
         weights = manifest.get("weights", {})
         if weights.get("format") != "npz" or not weights.get("file"):
             raise ValueError("LeNet JSON exports must reference a .weights.npz file")
-        with np.load(source.parent / weights["file"], allow_pickle=False) as archive:
+        weights_source = (source.parent / weights["file"]).resolve()
+        with np.load(weights_source, allow_pickle=False) as archive:
             state = {key: torch.from_numpy(archive[key].copy()) for key in archive.files}
+        manifest_source = source
     else:
         raise ValueError("model must be a LeNet trainer .pt or .json export")
     if manifest.get("format_version") != 1 or not isinstance(manifest.get("architecture"), dict):
         raise ValueError("not a supported self-describing LeNet trainer export")
     if not isinstance(state, dict):
         raise ValueError("LeNet export has no state_dict")
-    return LeNetExport(source, manifest, state)
+    _validate_tensor_shapes(manifest["architecture"], state)
+    return LeNetExport(source, manifest, state, manifest_source, weights_source)
+
+
+def _validate_tensor_shapes(architecture: dict[str, Any], state: dict[str, torch.Tensor]) -> None:
+    """Reject a manifest/checkpoint pair before it can be lowered incorrectly."""
+    for layer in architecture.get("layers", []):
+        op = layer.get("op")
+        if op not in ("conv2d", "linear"):
+            continue
+        weight_key, bias_key = layer.get("weight_key"), layer.get("bias_key")
+        if not isinstance(weight_key, str) or not isinstance(bias_key, str):
+            raise ValueError(f"{op} layer is missing tensor keys")
+        if weight_key not in state or bias_key not in state:
+            raise ValueError(f"missing tensor for {weight_key} or {bias_key}")
+        if op == "conv2d":
+            kernel = layer.get("kernel")
+            if not isinstance(kernel, list) or len(kernel) != 2:
+                raise ValueError(f"invalid kernel for {weight_key}")
+            expected = (layer.get("out_channels"), layer.get("in_channels"), *kernel)
+        else:
+            expected = (layer.get("out_features"), layer.get("in_features"))
+        if tuple(state[weight_key].shape) != tuple(expected):
+            raise ValueError(
+                f"{weight_key} has shape {tuple(state[weight_key].shape)}, expected {tuple(expected)}")
+        expected_bias = (expected[0],)
+        if tuple(state[bias_key].shape) != expected_bias:
+            raise ValueError(
+                f"{bias_key} has shape {tuple(state[bias_key].shape)}, expected {expected_bias}")
 
 
 def native_artifact(export: LeNetExport, cache_dir: str | Path | None = None) -> Path:
     """Materialize the worker's self-contained artifact and return its path."""
     fingerprint = hashlib.sha256()
-    fingerprint.update(export.source.read_bytes())
-    if export.source.suffix == ".json":
-        fingerprint.update((export.source.parent / export.manifest["weights"]["file"]).read_bytes())
+    fingerprint.update(export.manifest_source.read_bytes())
+    if export.weights_source != export.manifest_source:
+        fingerprint.update(export.weights_source.read_bytes())
     key = fingerprint.hexdigest()[:24]
     directory = Path(cache_dir or Path(tempfile.gettempdir()) / "sealtorch-models")
     directory.mkdir(parents=True, exist_ok=True)
