@@ -16,6 +16,7 @@ namespace sealtorch
     };
 
     enum class ActivationType { Relu, Gelu, Tanh };
+    enum class ActivationApproximation { LeastSquares, Chebyshev, Taylor };
     enum class OperationKind { Linear, Activation };
 
     struct Operation

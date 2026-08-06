@@ -60,7 +60,7 @@ build/sealtorch_gui --validate-model src/lenet.json
 - `src/app/ciphertext_inference.*` is the dashboard's provider adapter.
 - `src/SEALTorch/evaluator.*` runs Microsoft SEAL operations.
 - `src/app/cuda_ciphertext_inference.*` runs FIDESlib operations.
-- `src/SEALTorch/math.*` contains packed linear algebra and Taylor activation
+- `src/SEALTorch/math.*` contains packed linear algebra and fitted activation
   evaluation.
 - `src/SEALTorch/packing.h` finds the sparse diagonals needed by packed CKKS.
 - `src/main.cpp` translates JSON model artifacts and implements the native worker protocol.
@@ -95,14 +95,30 @@ pooling.
 
 Trainer exports are identified by their path below `exports/`, so models with
 the same filename in different experiment folders all appear in the dashboard.
-For encrypted inference, a clamp whose bounds contain zero lowers to the
-identity because that is its zero-centered Taylor series; the PyTorch path
-continues to apply the exact clamp.
+Encrypted inference rejects clamp layers because silently replacing a clamp
+with the identity changes the trained graph. Export a real supported
+activation and let SEALTorch approximate it instead.
 
-Encrypted activations use a zero-centered Taylor polynomial: `x` for ReLU,
-`x - x³/3` for tanh, and
-`x/2 + 0.3989422804x² - 0.0664903801x⁴` for GELU. `activation_degree` selects
-how many available terms are evaluated. The dashboard graphs the activation
-and polynomial over a configurable accuracy range and reports their error on
-that interval. The range is part of run, comparison, and benchmark
-configurations, and saved benchmark results retain the selected value.
+Encrypted activations use a power-basis polynomial selected by
+`approximation_method`: `least_squares` fits 257 uniformly spaced samples,
+`chebyshev` interpolates at Chebyshev roots, and `taylor` uses the historical
+zero-centered series. `activation_range` controls the fitting interval for
+least-squares and Chebyshev, while `activation_degree` selects the degree. The
+same coefficients drive CPU, CUDA, depth validation, and the dashboard graph.
+Activations outside the selected interval remain extrapolation; choose the
+range from measured model activations. Least-squares is the default because it
+preserved the best accuracy in the current LeNet regression checks.
+
+The dashboard accepts polynomial degrees 1 through 15. Its approximation
+advisor calibrates the selected model on a deterministic validation subset,
+scans candidate ranges, and reports validation accuracy, activation
+percentiles, effective polynomial degrees, required multiplicative depth, and
+the slot/security-driven ring recommendation before an expensive HE run. The
+Apply button sets the complete profile: range, depth, ring dimension, first
+modulus, scaling modulus, and CKKS scale. Deep lowered CNNs stream one layer of
+packed CUDA constants at a time instead of retaining every convolution
+plaintext on the GPU. CUDA retains all CPU-packed constants, keeps ordinary
+layers GPU-resident, and transfers only oversized lowered convolutions. Compact
+power-of-two rotation keys replace a separate key for every convolution
+rotation. Odd Tanh polynomials use the lower-depth `x * q(x²)` circuit; for
+example, degree 5 uses four multiplicative levels rather than five.

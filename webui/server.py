@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Small local API for the SEALTorch research dashboard."""
 import json
+import copy
+import math
 import os
 import pathlib
 import subprocess
@@ -49,12 +51,35 @@ NATIVE_MODELS = {
 }
 
 
+def trainer_artifact_is_current(path):
+    """Exclude exports whose training graph violated the current boundary.
+
+    Older experiments embedded an HE polynomial or a non-polynomial clamp in
+    the trainer. They cannot be faithfully reloaded by the real-activation
+    trainer and must be retrained before SEALTorch approximates them.
+    """
+    manifest_path = path.with_suffix(".json")
+    if not manifest_path.is_file():
+        return True
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True  # Let load_export provide the detailed validation error.
+    operations = {
+        layer.get("op")
+        for layer in manifest.get("architecture", {}).get("layers", [])
+    }
+    return not operations.intersection({"poly_gelu2", "clamp"})
+
+
 def available_models():
     """Expose every trainer export under a stable, collision-free ID."""
     models = {name: path for name, path in NATIVE_MODELS.items() if path.is_file()}
     exports = LENET_ROOT / "exports"
     if exports.is_dir():
         for path in sorted(exports.glob("**/*.pt")):
+            if not trainer_artifact_is_current(path):
+                continue
             relative = path.relative_to(exports).with_suffix("")
             models[f"trainer:{relative.as_posix()}"] = path
     return models
@@ -701,12 +726,33 @@ def benchmark_error_message(error, config=None):
     instead of leaving a misleading partial result in the dashboard.
     """
     message = str(error)
+    if "FIDESlib::GPUmalloc" in message or "GPUmalloc" in message:
+        config = config or {}
+        return (
+            "FIDESlib could not allocate the CUDA memory required to build "
+            "this CKKS context. Ring dimension "
+            f"{config.get('ring_dim', 'unknown')} with depth "
+            f"{config.get('depth', 'unknown')} is too large for the available "
+            "GPU memory. This happened during context setup, before inference; "
+            "use CPU HE, reduce the circuit, or select a viable lower-depth "
+            "approximation."
+        )
+    if "sealtorch_gui(+0x" in message and "\n" in message:
+        config = config or {}
+        return (
+            "The CUDA HE provider terminated while constructing or evaluating "
+            "the CKKS circuit. A native address-only backtrace usually means "
+            "GPU resource exhaustion. Ring dimension "
+            f"{config.get('ring_dim', 'unknown')} and depth "
+            f"{config.get('depth', 'unknown')} were requested; use the "
+            "advisor's complete modulus profile or switch to CPU HE."
+        )
     if "approximation error is too high" in message:
         config = config or {}
         degree = config.get("activation_degree", "the selected")
         return (
             "CUDA CKKS precision was exhausted before decode; no benchmark "
-            f"samples were recorded. The selected Taylor degree is {degree}. "
+            f"samples were recorded. The selected polynomial degree is {degree}. "
             "Apply the Deep CUDA profile (ring 65536, scaling modulus 59 "
             "bits, first modulus 60 bits) only as a diagnostic retry; it "
             "uses substantially more GPU memory and is not the preferred "
@@ -754,7 +800,10 @@ def execute(request, collect_telemetry=True):
         worker_request["model_path"] = str(
             native_artifact(load_export(model_file(model)))
             if is_trainer_model(model) else model_file(model))
-        result = he_worker_for(config).run(worker_request, binary)
+        try:
+            result = he_worker_for(config).run(worker_request, binary)
+        except RuntimeError as error:
+            raise RuntimeError(benchmark_error_message(error, config)) from error
         if "error" not in result:
             result["engine"] = "he"
             # The native worker reports whether this request used SEAL CPU or
@@ -1197,6 +1246,244 @@ def saved_benchmark_result(filename):
     return {"status": "complete", "result_file": str(path.relative_to(ROOT)), **data}
 
 
+def approximation_coefficients(kind, degree, radius, method):
+    """Mirror the native worker's power-basis activation approximation."""
+    degree = int(degree)
+    radius = float(radius)
+    if not 1 <= degree <= 15:
+        raise ValueError("activation degree must be between 1 and 15")
+    if not 0 < radius <= 32:
+        raise ValueError("activation range must be in (0, 32]")
+    if method == "taylor":
+        if kind == "relu": coefficients = [0.0, 1.0]
+        elif kind == "tanh": coefficients = [0.0, 1.0, 0.0, -1.0 / 3.0]
+        else:
+            root = math.sqrt(2.0 * math.pi)
+            coefficients = [0.0, 0.5, 1.0 / root, 0.0, -1.0 / (6.0 * root)]
+        coefficients = coefficients[:degree + 1]
+    elif method in ("least_squares", "chebyshev"):
+        count = degree + 1
+        if method == "chebyshev":
+            indices = torch.arange(count, dtype=torch.float64)
+            samples = radius * torch.cos(
+                math.pi * (2 * indices + 1) / (2 * count))
+        else:
+            samples = torch.linspace(-radius, radius, 257, dtype=torch.float64)
+        if kind == "relu": targets = torch.relu(samples)
+        elif kind == "tanh": targets = torch.tanh(samples)
+        else: targets = torch.nn.functional.gelu(samples)
+        vandermonde = torch.vander(samples, N=count, increasing=True)
+        if method == "chebyshev":
+            solution = torch.linalg.solve(vandermonde, targets)
+        else:
+            solution = torch.linalg.lstsq(vandermonde, targets).solution
+        coefficients = solution.tolist()
+    else:
+        raise ValueError(
+            "approximation_method must be least_squares, chebyshev, or taylor")
+    coefficients = [0.0 if abs(value) < 1e-12 else value
+                    for value in coefficients]
+    while len(coefficients) > 2 and coefficients[-1] == 0.0:
+        coefficients.pop()
+    return coefficients
+
+
+class PolynomialActivation(torch.nn.Module):
+    def __init__(self, coefficients):
+        super().__init__()
+        self.coefficients = coefficients
+
+    def forward(self, value):
+        result = torch.zeros_like(value)
+        for coefficient in reversed(self.coefficients):
+            result = result * value + coefficient
+        return result
+
+
+def replace_activations(module, degree, radius, method):
+    for name, child in list(module.named_children()):
+        if isinstance(child, torch.nn.ReLU): kind = "relu"
+        elif isinstance(child, torch.nn.GELU): kind = "gelu"
+        elif isinstance(child, torch.nn.Tanh): kind = "tanh"
+        else:
+            replace_activations(child, degree, radius, method)
+            continue
+        setattr(module, name, PolynomialActivation(
+            approximation_coefficients(kind, degree, radius, method)))
+
+
+def model_he_structure(name, degree, radius, method):
+    """Circuit depth and packing requirements for one translated model."""
+    if is_trainer_model(name):
+        layers = load_export(model_file(name)).manifest["architecture"]["layers"]
+        operation = lambda layer: layer.get("op", "")
+    else:
+        layers = native_manifest(name)["model"]["layers"]
+        operation = lambda layer: layer.get("type", "").lower()
+    linear = {"conv2d", "avg_pool2d", "avgpool2d", "linear"}
+    activations = {
+        "relu": "relu", "tanh": "tanh", "gelu": "gelu",
+        "approximategelu": "gelu",
+    }
+    linear_count = 0
+    activation_degrees = []
+    activation_depths = []
+    for layer in layers:
+        op = operation(layer).lower()
+        if op in linear:
+            linear_count += 1
+        elif op in activations:
+            coefficients = approximation_coefficients(
+                activations[op], degree, radius, method)
+            effective_degree = len(coefficients) - 1
+            activation_degrees.append(effective_degree)
+            odd = (len(coefficients) >= 4 and
+                   all(coefficients[order] == 0.0
+                       for order in range(0, len(coefficients), 2)))
+            activation_depths.append(
+                (effective_degree + 3) // 2 if odd else effective_degree)
+    return {
+        "linear_transforms": linear_count,
+        "activation_count": len(activation_degrees),
+        "effective_activation_degrees": activation_degrees,
+        "activation_multiplicative_depths": activation_depths,
+        "required_depth": 1 + linear_count + sum(activation_depths),
+        "minimum_ring_dimension": model_minimum_ring_dimension(name),
+    }
+
+
+def security_ring_dimension(total_modulus_bits):
+    # Microsoft SEAL's 128-bit-security coefficient-modulus limits. FIDESlib
+    # uses a different provider, but this remains a conservative common
+    # recommendation for a dashboard configuration.
+    limits = ((1024, 27), (2048, 54), (4096, 109), (8192, 218),
+              (16384, 438), (32768, 881), (65536, 1761), (131072, 3522))
+    return next((ring for ring, limit in limits
+                 if total_modulus_bits <= limit), 262144)
+
+
+def recommended_he_parameters(required_depth, minimum_ring_dimension):
+    """Smallest conservative ring with at least 30 precision bits per level."""
+    limits = ((1024, 27), (2048, 54), (4096, 109), (8192, 218),
+              (16384, 438), (32768, 881), (65536, 1761), (131072, 3522))
+    first_bits = 40
+    scaling_bits = 30
+    required_bits = first_bits + required_depth * scaling_bits
+    for ring, limit in limits:
+        if ring >= minimum_ring_dimension and limit >= required_bits:
+            return {
+                "recommended_ring_dimension": ring,
+                "recommended_first_modulus_bits": first_bits,
+                "recommended_scaling_modulus_bits": scaling_bits,
+                "recommended_scale_bits": scaling_bits,
+                "estimated_total_modulus_bits": required_bits,
+            }
+    return {
+        "recommended_ring_dimension": 262144,
+        "recommended_first_modulus_bits": first_bits,
+        "recommended_scaling_modulus_bits": scaling_bits,
+        "recommended_scale_bits": scaling_bits,
+        "estimated_total_modulus_bits": required_bits,
+    }
+
+
+def recommend_approximation(config, sample_count=256):
+    """Calibrate a range and report the HE parameters needed by its degree."""
+    name = config.get("model", "trainer:mnist/lenet5_mnist")
+    if name not in available_models():
+        raise ValueError("unknown model")
+    degree = int(config.get("activation_degree", 3))
+    method = config.get("approximation_method", "least_squares")
+    current_radius = float(config.get("activation_range", 4.0))
+    dataset = trainer_validation_set(name)
+    # A stable range recommendation needs enough class/shape diversity; the
+    # dashboard always calibrates on 256 deterministic validation samples.
+    count = min(256, len(dataset.labels))
+    indices = torch.linspace(0, len(dataset.labels) - 1, count).long().tolist()
+    inputs = torch.cat([
+        prepare_validation_input(dataset.pixels_at(index), name)
+        for index in indices
+    ])
+    labels = torch.tensor([dataset.labels[index] for index in indices])
+    model, _ = plaintext_model(name, "cpu")
+
+    observed = []
+    hooks = []
+    for module in model.modules():
+        if isinstance(module, (torch.nn.ReLU, torch.nn.GELU, torch.nn.Tanh)):
+            hooks.append(module.register_forward_hook(
+                lambda _module, values, _output:
+                    observed.append(values[0].detach().abs().reshape(-1).cpu())))
+    with torch.inference_mode():
+        exact = model(inputs)
+    for hook in hooks: hook.remove()
+    exact_predictions = exact.argmax(1)
+    exact_accuracy = float((exact_predictions == labels).float().mean())
+    distribution = torch.cat(observed) if observed else torch.tensor([current_radius])
+    maximum = float(distribution.max())
+    p99 = float(torch.quantile(distribution, 0.99))
+    p995 = float(torch.quantile(distribution, 0.995))
+
+    if method == "taylor":
+        candidates = [current_radius]
+    else:
+        upper = min(16.0, max(2.0, math.ceil((maximum + 2.0) * 2.0) / 2.0))
+        candidates = [step / 2.0 for step in range(1, round(upper * 2) + 1)]
+        candidates.append(current_radius)
+    trials = []
+    for radius in sorted(set(candidates)):
+        candidate = copy.deepcopy(model)
+        try:
+            replace_activations(candidate, degree, radius, method)
+            with torch.inference_mode(): output = candidate(inputs)
+            if not torch.isfinite(output).all(): continue
+            predictions = output.argmax(1)
+            trials.append({
+                "range": radius,
+                "accuracy": float((predictions == labels).float().mean()),
+                "agreement": float((predictions == exact_predictions).float().mean()),
+            })
+        except (RuntimeError, ValueError):
+            continue
+    if not trials:
+        raise RuntimeError("no numerically stable approximation range was found")
+    best = max(trials, key=lambda trial: (trial["accuracy"], trial["agreement"]))
+    accuracy_drop = exact_accuracy - best["accuracy"]
+    # A range search can always return a mathematical maximum, even when every
+    # tested polynomial destroys the model.  Do not confuse "least bad" with a
+    # usable recommendation.
+    viable = accuracy_drop <= 0.05 and best["agreement"] >= 0.85
+    structure = model_he_structure(name, degree, best["range"], method)
+    parameters = recommended_he_parameters(
+        structure["required_depth"], structure["minimum_ring_dimension"])
+    return {
+        "model": name,
+        "dataset": dataset.dataset,
+        "samples": count,
+        "method": method,
+        "requested_degree": degree,
+        "suggested_range": best["range"],
+        "calibration_accuracy": best["accuracy"],
+        "prediction_agreement": best["agreement"],
+        "exact_accuracy": exact_accuracy,
+        "accuracy_drop": accuracy_drop,
+        "viable": viable,
+        "observed_activation_abs_max": maximum,
+        "observed_activation_abs_p99": p99,
+        "observed_activation_abs_p995": p995,
+        **structure,
+        **parameters,
+        "warning": (
+            "Warning: this is the best tested range, but calibration shows "
+            "substantial accuracy loss. You can still apply and run it; "
+            "consider increasing the degree, changing approximation method, "
+            "or using a model trained to tolerate polynomial activations."
+            if not viable else
+            "This circuit is exceptionally deep and may exceed available GPU memory."
+            if structure["required_depth"] > 30 else None),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, value, status=200):
         data = json.dumps(value, allow_nan=False).encode("utf-8")
@@ -1317,6 +1604,10 @@ class Handler(BaseHTTPRequestHandler):
                     shuffle_seed,
                 )
                 self.send_json(job, 202)
+            elif self.path == "/api/approximation/recommend":
+                self.send_json(recommend_approximation(
+                    request.get("config", {}),
+                    request.get("sample_count", 256)))
             elif self.path == "/api/mnist/download":
                 self.send_json(download_mnist())
             else:

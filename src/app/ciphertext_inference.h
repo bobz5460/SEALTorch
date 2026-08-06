@@ -25,6 +25,9 @@ namespace sealtorch
         std::size_t first_modulus_bits = 50;
         std::size_t scale_bits = 40;
         std::size_t activation_degree = 3;
+        double activation_range = 4.0;
+        ActivationApproximation approximation_method =
+            ActivationApproximation::LeastSquares;
         int cuda_device = 0;
     };
 

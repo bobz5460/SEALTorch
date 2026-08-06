@@ -17,6 +17,9 @@ namespace sealtorch
         double scale;
         std::size_t thread_count = 4;
         std::size_t activation_degree = 3;
+        double activation_range = 4.0;
+        ActivationApproximation approximation_method =
+            ActivationApproximation::LeastSquares;
     };
 
     // SEALTorch receives encrypted user data and returns encrypted results.

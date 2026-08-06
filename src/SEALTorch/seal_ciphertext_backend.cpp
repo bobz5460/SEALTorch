@@ -25,7 +25,8 @@ namespace sealtorch
                 value = evaluator_.activation(
                     value, operation.activation_type, config.context,
                     config.relin_keys, config.scale,
-                    config.activation_degree);
+                    config.activation_degree, config.activation_range,
+                    config.approximation_method);
             }
         }
         return value;

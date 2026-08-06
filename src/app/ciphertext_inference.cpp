@@ -109,7 +109,8 @@ namespace sealtorch
 
                 SealInferenceConfig config{
                     context_, evaluator_, relin_keys_, galois_keys_, encoder_,
-                    scale_, options_.thread_count, options_.activation_degree};
+                    scale_, options_.thread_count, options_.activation_degree,
+                    options_.activation_range, options_.approximation_method};
                 const auto evaluate_start = std::chrono::steady_clock::now();
                 const seal::Ciphertext output = model_.predict(encrypted, config);
                 const auto evaluate_end = std::chrono::steady_clock::now();
@@ -175,6 +176,8 @@ namespace sealtorch
                     options.scaling_modulus_bits,
                     options.first_modulus_bits,
                     options.activation_degree,
+                    options.activation_range,
+                    options.approximation_method,
                     options.cuda_device,
                 };
                 cuda_engine =

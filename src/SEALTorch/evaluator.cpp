@@ -111,12 +111,14 @@ namespace sealtorch
         const seal::SEALContext &context,
         const seal::RelinKeys &relin_keys,
         double scale,
-        std::size_t degree) const
+        std::size_t degree,
+        double range,
+        ActivationApproximation method) const
     {
         seal::Evaluator local_evaluator(context);
         seal::CKKSEncoder local_encoder(context);
         return approximate_activation(
             local_evaluator, relin_keys, local_encoder, input, scale, type,
-            degree);
+            degree, range, method);
     }
 }

@@ -34,7 +34,9 @@ namespace sealtorch
             const seal::SEALContext &context,
             const seal::RelinKeys &relin_keys,
             double scale,
-            std::size_t degree) const;
+            std::size_t degree,
+            double range,
+            ActivationApproximation method) const;
 
     private:
         Sequential model_;

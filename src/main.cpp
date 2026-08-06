@@ -384,17 +384,10 @@ static ModelArtifact load_model(const std::string &path) {
             } else if (op == "flatten") {
                 // Lowered convolution/pooling tensors are already flat NCHW vectors.
             } else if (op == "clamp") {
-                const double lower = layer.has("min")
-                    ? layer.at("min").number
-                    : -std::numeric_limits<double>::infinity();
-                const double upper = layer.has("max")
-                    ? layer.at("max").number
-                    : std::numeric_limits<double>::infinity();
-                if (lower > 0.0 || upper < 0.0)
-                    throw std::runtime_error(
-                        "encrypted clamp bounds must contain the Taylor center zero");
-                // Clamp is the identity around zero, so it does not change
-                // the zero-centered Taylor series used by encrypted inference.
+                throw std::runtime_error(
+                    "encrypted inference cannot preserve a clamp layer; "
+                    "re-export a model trained with a real supported activation "
+                    "and let SEALTorch approximate that activation");
             } else if (op == "linear") {
                 const std::vector<double> weights = read_tensor(tensors, layer.at("weight_key").string);
                 const std::vector<double> biases = read_tensor(tensors, layer.at("bias_key").string);
@@ -489,6 +482,9 @@ struct RunConfig {
     int first_mod_bits = 50;
     int scale_bits = 40;
     int activation_degree = 3;
+    double activation_range = 4.0;
+    sealtorch::ActivationApproximation approximation_method =
+        sealtorch::ActivationApproximation::LeastSquares;
 
     bool operator==(const RunConfig &) const = default;
 };
@@ -514,6 +510,31 @@ static int int_or(
     return static_cast<int>(value.number);
 }
 
+static double double_or(
+    const json::Value &object,
+    const std::string &name,
+    double fallback)
+{
+    if (!object.has(name)) return fallback;
+    const auto &value = object.at(name);
+    return value.kind == json::Value::Kind::string
+        ? std::stod(value.string)
+        : value.number;
+}
+
+static sealtorch::ActivationApproximation approximation_method_for(
+    const std::string &value)
+{
+    if (value == "least_squares")
+        return sealtorch::ActivationApproximation::LeastSquares;
+    if (value == "chebyshev")
+        return sealtorch::ActivationApproximation::Chebyshev;
+    if (value == "taylor")
+        return sealtorch::ActivationApproximation::Taylor;
+    throw std::runtime_error(
+        "approximation_method must be least_squares, chebyshev, or taylor");
+}
+
 static RunConfig parse_config(const json::Value &request)
 {
     const json::Value &value = request.has("config") ? request.at("config") : request;
@@ -528,6 +549,9 @@ static RunConfig parse_config(const json::Value &request)
     config.first_mod_bits = int_or(value, "first_mod_bits", 50);
     config.scale_bits = int_or(value, "scale_bits", 40);
     config.activation_degree = int_or(value, "activation_degree", 3);
+    config.activation_range = double_or(value, "activation_range", 4.0);
+    config.approximation_method = approximation_method_for(
+        string_or(value, "approximation_method", "least_squares"));
 
     if (threads < 1)
         throw std::runtime_error("threads must be greater than zero");
@@ -539,8 +563,11 @@ static RunConfig parse_config(const json::Value &request)
     if (config.depth < 1 || config.scaling_mod_bits < 1 ||
         config.first_mod_bits < 1 || config.scale_bits < 1)
         throw std::runtime_error("ciphertext bit sizes must be positive");
-    if (config.activation_degree < 1 || config.activation_degree > 4)
-        throw std::runtime_error("activation_degree must be between 1 and 4");
+    if (config.activation_degree < 1 || config.activation_degree > 15)
+        throw std::runtime_error("activation_degree must be between 1 and 15");
+    if (!std::isfinite(config.activation_range) ||
+        config.activation_range <= 0.0 || config.activation_range > 32.0)
+        throw std::runtime_error("activation_range must be in (0, 32]");
     if (config.device != "cuda" &&
         config.scale_bits != config.scaling_mod_bits)
         throw std::runtime_error(
@@ -570,6 +597,8 @@ static sealtorch::CiphertextInferenceOptions ciphertext_inference_options(
         static_cast<std::size_t>(config.first_mod_bits),
         static_cast<std::size_t>(config.scale_bits),
         static_cast<std::size_t>(config.activation_degree),
+        config.activation_range,
+        config.approximation_method,
         0
     };
     return options;
@@ -643,13 +672,12 @@ static std::vector<double> request_pixels(const json::Value &request)
 
 static std::size_t activation_multiplicative_depth(
     sealtorch::ActivationType type,
-    std::size_t degree)
+    std::size_t degree,
+    double range,
+    sealtorch::ActivationApproximation method)
 {
-    if (type == sealtorch::ActivationType::Relu) return 0;
-    if (type == sealtorch::ActivationType::Tanh)
-        return degree >= 3 ? 3 : 1;
-    if (degree >= 4) return 4;
-    return degree >= 2 ? 2 : 1;
+    return sealtorch::activation_polynomial_depth(
+        type, degree, range, method);
 }
 
 static void print_result(
@@ -727,7 +755,7 @@ static int run_web_worker()
                         " so ciphertext inference matches its training graph");
                 if (artifact.cnn) {
                     // Every lowered linear transform consumes one rescale and
-                    // Each fixed Taylor term consumes one rescale level.
+                    // Each polynomial order consumes one rescale level.
                     // Keep one unused level for final decryption precision.
                     // Consuming the entire chain can make OpenFHE decoding
                     // fail even when every requested operation fits.
@@ -740,7 +768,9 @@ static int run_web_worker()
                                  sealtorch::OperationKind::Activation) {
                             required_depth += activation_multiplicative_depth(
                                 operation.activation_type,
-                                options.activation_degree);
+                                options.activation_degree,
+                                options.activation_range,
+                                options.approximation_method);
                         }
                     }
                     if (options.multiplicative_depth < required_depth)

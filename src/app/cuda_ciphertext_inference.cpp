@@ -46,6 +46,31 @@ namespace sealtorch::cuda
             bool has_activation = false;
         };
 
+        void load_layer(const Context &context, PackedLayer &layer)
+        {
+            for (auto &group : layer.groups)
+                for (auto &diagonal : group.diagonals)
+                    context->LoadPlaintext(diagonal.weights);
+            context->LoadPlaintext(layer.bias);
+        }
+
+        void evict_plaintext(const Context &context, Plaintext &plaintext)
+        {
+            if (!plaintext->loaded) return;
+            context->EvictDevicePlaintext(plaintext->gpu);
+            plaintext->loaded = false;
+            plaintext->gpu = 0;
+        }
+
+        void evict_layer(const Context &context, PackedLayer &layer)
+        {
+            cudaDeviceSynchronize();
+            for (auto &group : layer.groups)
+                for (auto &diagonal : group.diagonals)
+                    evict_plaintext(context, diagonal.weights);
+            evict_plaintext(context, layer.bias);
+        }
+
         void require_cuda_device(int device)
         {
             int device_count = 0;
@@ -54,36 +79,34 @@ namespace sealtorch::cuda
         }
 
         std::vector<std::int32_t> rotation_steps(
-            const Sequential &model,
             std::size_t slot_count)
         {
             std::vector<std::int32_t> steps;
-            for (const Operation &operation : model.operations())
-            {
-                if (operation.kind != OperationKind::Linear)
-                    continue;
-
-                const std::vector<std::size_t> diagonals =
-                    active_diagonals(operation.linear_layer, slot_count);
-                const std::size_t baby_step =
-                    baby_step_size(slot_count, diagonals.size());
-                for (std::size_t diagonal : diagonals)
-                {
-                    const DiagonalSplit split =
-                        split_diagonal(diagonal, baby_step);
-                    const std::int32_t baby_rotation =
-                        signed_rotation(split.baby, slot_count);
-                    const std::int32_t giant_rotation =
-                        signed_rotation(split.giant, slot_count);
-                    if (baby_rotation != 0)
-                        steps.push_back(baby_rotation);
-                    if (giant_rotation != 0)
-                        steps.push_back(giant_rotation);
-                }
+            for (std::size_t power = 1; power <= slot_count / 2; power <<= 1) {
+                steps.push_back(static_cast<std::int32_t>(power));
+                steps.push_back(-static_cast<std::int32_t>(power));
             }
             std::sort(steps.begin(), steps.end());
             steps.erase(std::unique(steps.begin(), steps.end()), steps.end());
             return steps;
+        }
+
+        Ciphertext rotate(
+            const Context &context, const Ciphertext &input,
+            std::int32_t rotation)
+        {
+            if (rotation == 0) return input;
+            Ciphertext result = input;
+            std::uint32_t remaining = static_cast<std::uint32_t>(
+                rotation < 0 ? -static_cast<std::int64_t>(rotation) : rotation);
+            std::int32_t power = rotation < 0 ? -1 : 1;
+            while (remaining != 0) {
+                if (remaining & 1U)
+                    result = context->EvalRotate(result, power);
+                remaining >>= 1U;
+                power *= 2;
+            }
+            return result;
         }
 
         PackedLayer prepare_layer(
@@ -162,7 +185,7 @@ namespace sealtorch::cuda
                 rotated_inputs.push_back(
                     rotation == 0
                         ? input
-                        : context->EvalRotate(input, rotation));
+                        : rotate(context, input, rotation));
             }
 
             Ciphertext result;
@@ -184,8 +207,7 @@ namespace sealtorch::cuda
                     }
                 }
                 if (group.rotation != 0)
-                    subtotal = context->EvalRotate(
-                        subtotal, group.rotation);
+                    subtotal = rotate(context, subtotal, group.rotation);
 
                 if (first_group) {
                     result = std::move(subtotal);
@@ -203,10 +225,44 @@ namespace sealtorch::cuda
             const Context &context,
             const Ciphertext &input,
             ActivationType type,
-            std::size_t degree)
+            std::size_t degree,
+            double range,
+            ActivationApproximation method)
         {
-            const auto coefficients = activation_taylor_coefficients(type, degree);
+            const auto coefficients = activation_polynomial_coefficients(
+                type, degree, range, method);
             const std::size_t highest = coefficients.size() - 1;
+
+            const bool odd_polynomial = coefficients.size() >= 4 &&
+                [&coefficients]() {
+                    for (std::size_t order = 0;
+                         order < coefficients.size(); order += 2)
+                        if (coefficients[order] != 0.0) return false;
+                    return true;
+                }();
+            if (odd_polynomial) {
+                Ciphertext square = context->EvalMult(input, input);
+                context->RescaleInPlace(square);
+                Ciphertext result = square->Clone();
+                context->EvalMultInPlace(result, coefficients[highest]);
+                context->RescaleInPlace(result);
+                for (std::size_t order = highest - 2;
+                     order > 1; order -= 2) {
+                    if (coefficients[order] != 0.0)
+                        context->EvalAddInPlace(result, coefficients[order]);
+                    Ciphertext factor = square->Clone();
+                    factor->SetLevel(result->GetLevel());
+                    result = context->EvalMult(result, factor);
+                    context->RescaleInPlace(result);
+                }
+                if (coefficients[1] != 0.0)
+                    context->EvalAddInPlace(result, coefficients[1]);
+                Ciphertext factor = input->Clone();
+                factor->SetLevel(result->GetLevel());
+                result = context->EvalMult(result, factor);
+                context->RescaleInPlace(result);
+                return result;
+            }
 
             Ciphertext result = input->Clone();
             if (coefficients[highest] != 1.0) {
@@ -238,10 +294,12 @@ namespace sealtorch::cuda
         CiphertextInferenceOptions options;
         Context context;
         fideslib::KeyPair<fideslib::DCRTPoly> keys;
-        std::vector<PackedLayer> layers;
+        Sequential model;
+        std::vector<std::unique_ptr<PackedLayer>> cached_layers;
+        std::vector<bool> resident_layers;
 
         Implementation(Sequential model_value, CiphertextInferenceOptions options_value)
-            : options(std::move(options_value))
+            : options(std::move(options_value)), model(std::move(model_value))
         {
             if (options.thread_count == 0 ||
                 options.thread_count >
@@ -255,7 +313,7 @@ namespace sealtorch::cuda
             omp_set_num_threads(static_cast<int>(options.thread_count));
 
             const DenseLayer *first_layer = nullptr;
-            for (const Operation &operation : model_value.operations())
+            for (const Operation &operation : model.operations())
             {
                 if (operation.kind == OperationKind::Linear)
                 {
@@ -296,7 +354,10 @@ namespace sealtorch::cuda
             // CNN lowering has thousands of sparse diagonals. Eagerly
             // loading all of them permanently occupies GPU memory; let
             // FIDES transfer a diagonal when its multiplication is issued.
-            parameters.SetPlaintextAutoload(true);
+            // Keep packed CPU encodings for every model constant. Selected
+            // layers are loaded permanently below; oversized layers reuse the
+            // CPU encoding while their GPU copy is loaded/evicted per run.
+            parameters.SetPlaintextAutoload(false);
             parameters.SetCiphertextAutoload(true);
             context = fideslib::GenCryptoContext(parameters);
             context->Enable(fideslib::PKE);
@@ -306,18 +367,27 @@ namespace sealtorch::cuda
             keys = context->KeyGen();
             context->EvalMultKeyGen(keys.secretKey);
             context->EvalRotateKeyGen(
-                keys.secretKey, rotation_steps(model_value, slot_count()));
+                keys.secretKey, rotation_steps(slot_count()));
             context->LoadContext(keys.publicKey);
 
-            for (const Operation &operation : model_value.operations())
-            {
-                if (operation.kind == OperationKind::Linear)
-                    layers.push_back(prepare_layer(
+            cached_layers.resize(model.operations().size());
+            resident_layers.resize(model.operations().size(), false);
+            for (std::size_t index = 0;
+                 index < model.operations().size(); ++index) {
+                const Operation &operation = model.operations()[index];
+                if (operation.kind != OperationKind::Linear) continue;
+                const std::size_t diagonal_count = active_diagonals(
+                    operation.linear_layer, slot_count()).size();
+                // Cache normal layers, but stream unusually large lowered
+                // convolutions. This avoids both all-model OOM and all-layer
+                // repacking on every prediction.
+                cached_layers[index] = std::make_unique<PackedLayer>(
+                    prepare_layer(
                         context, operation.linear_layer, slot_count(),
                         false, ActivationType::Relu));
-                else {
-                    layers.back().has_activation = true;
-                    layers.back().activation = operation.activation_type;
+                if (diagonal_count <= 2048) {
+                    load_layer(context, *cached_layers[index]);
+                    resident_layers[index] = true;
                 }
             }
         }
@@ -326,7 +396,7 @@ namespace sealtorch::cuda
 
         CiphertextInferenceResult predict(const std::vector<double> &input)
         {
-            if (input.size() != static_cast<std::size_t>(layers.front().input_size))
+            if (input.size() != static_cast<std::size_t>(model.input_size()))
                 throw std::runtime_error("input size does not match the model");
 
             CiphertextInferenceResult result;
@@ -336,13 +406,20 @@ namespace sealtorch::cuda
             cudaDeviceSynchronize();
             const auto encrypt_end = std::chrono::steady_clock::now();
             const auto evaluate_start = encrypt_end;
-            for (PackedLayer &layer : layers)
-            {
-                encrypted = linear(context, encrypted, layer);
-                if (layer.has_activation)
+            for (std::size_t index = 0;
+                 index < model.operations().size(); ++index) {
+                const Operation &operation = model.operations()[index];
+                if (operation.kind == OperationKind::Linear) {
+                    PackedLayer &layer = *cached_layers[index];
+                    encrypted = linear(context, encrypted, layer);
+                    if (!resident_layers[index])
+                        evict_layer(context, layer);
+                } else {
                     encrypted = activate(
-                        context, encrypted, layer.activation,
-                        options.activation_degree);
+                        context, encrypted, operation.activation_type,
+                        options.activation_degree, options.activation_range,
+                        options.approximation_method);
+                }
             }
             cudaDeviceSynchronize();
             const auto evaluate_end = std::chrono::steady_clock::now();
@@ -352,7 +429,7 @@ namespace sealtorch::cuda
             context->Decrypt(encrypted, keys.secretKey, &decoded);
             cudaDeviceSynchronize();
             result.values = decoded->GetRealPackedValue();
-            result.values.resize(static_cast<std::size_t>(layers.back().output_size));
+            result.values.resize(static_cast<std::size_t>(model.output_size()));
             if (!std::all_of(
                     result.values.begin(), result.values.end(),
                     [](double value) { return std::isfinite(value); }))

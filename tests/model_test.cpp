@@ -3,6 +3,7 @@
 #include <SEALTorch/packing.h>
 
 #include <cassert>
+#include <cmath>
 #include <vector>
 
 namespace
@@ -55,16 +56,57 @@ namespace
         assert(model.operations().size() == 2);
     }
 
-    void test_fixed_taylor_series()
+    double polynomial(const std::vector<double> &coefficients, double value)
     {
-        assert((sealtorch::activation_taylor_coefficients(
-                    sealtorch::ActivationType::Relu, 4) ==
-                std::vector<double>{0.0, 1.0}));
-        assert((sealtorch::activation_taylor_coefficients(
-                    sealtorch::ActivationType::Tanh, 3) ==
-                std::vector<double>{0.0, 1.0, 0.0, -1.0 / 3.0}));
-        assert(sealtorch::activation_taylor_coefficients(
-                   sealtorch::ActivationType::Gelu, 2).size() == 3);
+        double result = 0.0;
+        for (auto item = coefficients.rbegin(); item != coefficients.rend(); ++item)
+            result = result * value + *item;
+        return result;
+    }
+
+    void test_interval_activation_polynomials()
+    {
+        const auto tanh = sealtorch::activation_polynomial_coefficients(
+            sealtorch::ActivationType::Tanh, 3, 4.0);
+        assert(tanh.size() == 4);
+        assert(std::abs(polynomial(tanh, 4.0) - std::tanh(4.0)) < 0.4);
+        assert(std::abs(polynomial(tanh, -4.0) - std::tanh(-4.0)) < 0.4);
+
+        const auto relu = sealtorch::activation_polynomial_coefficients(
+            sealtorch::ActivationType::Relu, 4, 4.0);
+        assert(relu.size() == 5);
+        assert(std::abs(polynomial(relu, 2.0) - 2.0) < 0.25);
+
+        const auto narrow = sealtorch::activation_polynomial_coefficients(
+            sealtorch::ActivationType::Gelu, 4, 2.0);
+        const auto wide = sealtorch::activation_polynomial_coefficients(
+            sealtorch::ActivationType::Gelu, 4, 4.0);
+        assert(narrow != wide);
+
+        const auto taylor = sealtorch::activation_polynomial_coefficients(
+            sealtorch::ActivationType::Tanh, 3, 4.0,
+            sealtorch::ActivationApproximation::Taylor);
+        assert((taylor == std::vector<double>{
+            0.0, 1.0, 0.0, -1.0 / 3.0}));
+
+        const auto chebyshev = sealtorch::activation_polynomial_coefficients(
+            sealtorch::ActivationType::Tanh, 3, 4.0,
+            sealtorch::ActivationApproximation::Chebyshev);
+        assert(chebyshev != tanh);
+        assert(std::abs(polynomial(chebyshev, 4.0) - std::tanh(4.0)) < 0.5);
+
+        const auto degree_seven =
+            sealtorch::activation_polynomial_coefficients(
+                sealtorch::ActivationType::Tanh, 7, 6.0,
+                sealtorch::ActivationApproximation::Chebyshev);
+        assert(degree_seven.size() == 8);
+        assert(std::abs(polynomial(degree_seven, 6.0) - std::tanh(6.0)) < 0.25);
+        assert(sealtorch::activation_polynomial_depth(
+            sealtorch::ActivationType::Tanh, 5, 3.5,
+            sealtorch::ActivationApproximation::Chebyshev) == 4);
+        assert(sealtorch::activation_polynomial_depth(
+            sealtorch::ActivationType::Tanh, 7, 6.0,
+            sealtorch::ActivationApproximation::Chebyshev) == 5);
     }
 }
 
@@ -73,5 +115,5 @@ int main()
     test_sparse_diagonals();
     test_zero_layer();
     test_sequential_model();
-    test_fixed_taylor_series();
+    test_interval_activation_polynomials();
 }

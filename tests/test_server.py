@@ -38,10 +38,11 @@ class ServerTests(unittest.TestCase):
 
     def test_trainer_model_produces_exported_number_of_outputs(self):
         pixels = [0.0] * 784
-        self.assertIn(server.model_activation("trainer:lenet5_mnist"),
+        name = "trainer:mnist/lenet5_mnist"
+        self.assertIn(server.model_activation(name),
                       ("relu", "gelu", "tanh"))
         output, _, device, _ = server.run_plaintext(
-            pixels, "trainer:lenet5_mnist", "cpu")
+            pixels, name, "cpu")
         self.assertEqual(device, "cpu")
         self.assertEqual(len(output), 10)
         self.assertTrue(all(math.isfinite(value) for value in output))
@@ -115,13 +116,42 @@ class ServerTests(unittest.TestCase):
         self.assertIn("ring 65536", message)
         self.assertIn("degree is 3", message)
 
-    def test_he_native_emnist_export_advertises_its_exact_cuda_profile(self):
+    def test_cuda_allocation_failure_has_actionable_message(self):
+        message = server.benchmark_error_message(
+            RuntimeError("FIDESlib::GPUmalloc(int, int)"),
+            {"ring_dim": 65536, "depth": 32})
+        self.assertIn("could not allocate", message)
+        self.assertIn("65536", message)
+        self.assertIn("depth 32", message)
+        self.assertIn("before inference", message)
+
+    def test_legacy_polynomial_trainer_export_is_not_advertised(self):
         name = "trainer:emnist-he/lenet_he_emnist-byclass"
+        self.assertNotIn(name, server.available_models())
+
+    def test_legacy_clamped_trainer_export_is_not_advertised(self):
+        name = "trainer:gelu-clamped/lenet5_mnist"
+        self.assertNotIn(name, server.available_models())
+
+    def test_degree_seven_advisor_reports_full_lenet_requirements(self):
+        name = "trainer:emnist-lenet-5/lenet5_emnist-byclass"
         if name not in server.available_models():
-            self.skipTest("HE-native EMNIST export is not installed")
-        self.assertEqual(server.model_activation(name), "poly_gelu2")
-        self.assertEqual(server.model_he_activation_degree(name), 2)
-        self.assertEqual(server.model_he_profile(name)["ring_dim"], 8192)
+            self.skipTest("EMNIST LeNet export is not installed")
+        structure = server.model_he_structure(
+            name, 7, 6.0, "chebyshev")
+        self.assertEqual(structure["linear_transforms"], 7)
+        self.assertEqual(structure["activation_count"], 4)
+        self.assertEqual(structure["effective_activation_degrees"], [7] * 4)
+        self.assertEqual(structure["activation_multiplicative_depths"], [5] * 4)
+        self.assertEqual(structure["required_depth"], 28)
+        self.assertEqual(structure["minimum_ring_dimension"], 16384)
+
+    def test_degree_five_full_lenet_profile_fits_ring_32768(self):
+        parameters = server.recommended_he_parameters(24, 16384)
+        self.assertEqual(parameters["recommended_ring_dimension"], 32768)
+        self.assertEqual(parameters["recommended_first_modulus_bits"], 40)
+        self.assertEqual(parameters["recommended_scaling_modulus_bits"], 30)
+        self.assertEqual(parameters["estimated_total_modulus_bits"], 760)
 
 
 if __name__ == "__main__":
