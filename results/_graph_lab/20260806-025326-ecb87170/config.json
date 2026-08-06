@@ -1,0 +1,52 @@
+{
+  "runs": [
+    "20260806-022042-a766e1f8"
+  ],
+  "source": "summary",
+  "x": "degree",
+  "left_y": [
+    "plaintext_polynomial_accuracy"
+  ],
+  "right_y": [
+    "encrypted_mean_ms"
+  ],
+  "left_type": "line",
+  "right_type": "line",
+  "hue": "method",
+  "style": "",
+  "facet": "",
+  "filters": {},
+  "title": "",
+  "x_label": "",
+  "left_label": "",
+  "right_label": "",
+  "theme": "whitegrid",
+  "context": "notebook",
+  "palette": "colorblind",
+  "aggregation": "none",
+  "error_bar": "none",
+  "x_scale": "linear",
+  "y_left_scale": "linear",
+  "y_right_scale": "linear",
+  "y_left_min": null,
+  "y_left_max": null,
+  "y_right_min": null,
+  "y_right_max": null,
+  "width": 10,
+  "height": 6,
+  "dpi": 180,
+  "facet_columns": 2,
+  "alpha": 0.9,
+  "line_width": 2,
+  "point_size": 55,
+  "bins": 30,
+  "font_scale": 1,
+  "legend_font_size": 8,
+  "markers": true,
+  "grid": true,
+  "legend": true,
+  "fill": false,
+  "annotations": false,
+  "graph_id": "20260806-025326-ecb87170",
+  "created_at": "2026-08-06T02:53:26Z"
+}

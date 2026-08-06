@@ -1,0 +1,4 @@
+timestamp,event,status,completed,total,gpu,phase,detail,phase_completed,phase_total,elapsed_seconds,eta_seconds
+2026-08-06T07:18:22.571841504Z,phase,running,0,1,0,Loading model,Reading the trained artifact,0,0,2.5272369384765625e-05,
+2026-08-06T07:18:22.821379369Z,phase,running,0,1,0,Loading dataset,Preparing the emnist data splits,0,0,0.29213452339172363,
+2026-08-06T07:18:25.159218668Z,phase,running,0,1,0,Selecting validation samples,Taking 100 deterministic samples per class,0,0,2.6295645236968994,

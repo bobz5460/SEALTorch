@@ -1,0 +1,15 @@
+{
+  "id": "20260806-071822-e2dfdbd6",
+  "sweep_id": "20260806-071822-8bbaf85a",
+  "status": "running",
+  "completed": 0,
+  "total": 1,
+  "error": null,
+  "gpu": 2,
+  "phase": "Selecting validation samples",
+  "detail": "Taking 100 deterministic samples per class",
+  "phase_completed": 0,
+  "phase_total": 0,
+  "elapsed_seconds": 2.316091537475586,
+  "eta_seconds": null
+}

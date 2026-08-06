@@ -1,0 +1,161 @@
+{
+  "sweep_id": "20260806-071822-8bbaf85a",
+  "run_ids": [
+    "20260806-071822-070e781b",
+    "20260806-071822-7c462445",
+    "20260806-071822-e2dfdbd6",
+    "20260806-071822-e7e422a9"
+  ],
+  "kind": "manual",
+  "label": "Manual graph data",
+  "gpu_count": 4,
+  "assigned_gpus": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "jobs": [
+    {
+      "name": "GELU taylor",
+      "model": "emnist/mlp-gelu.json",
+      "method": "taylor",
+      "degree": 2,
+      "range": 32.0,
+      "gpu": 0,
+      "run_plaintext": true,
+      "run_encrypted": true,
+      "samples_per_class": 100,
+      "timed_runs": 1000,
+      "warmup_runs": 5,
+      "seed": 42,
+      "weight_cache": "gpu",
+      "activation_split": "train",
+      "activation_samples_per_class": 500,
+      "activation_sample_limit": 960000,
+      "polynomial_coefficients": [
+        204.2584475655336,
+        16.000000000000046,
+        204.2584475655336
+      ],
+      "fideslib_coefficients": null,
+      "accuracy_indices": null,
+      "activation_indices": null,
+      "he_parameters": {
+        "ring_dim": 16384,
+        "depth": 9,
+        "scaling_mod_bits": 25,
+        "first_mod_bits": 35
+      }
+    },
+    {
+      "name": "GELU taylor",
+      "model": "emnist/mlp-gelu.json",
+      "method": "taylor",
+      "degree": 4,
+      "range": 32.0,
+      "gpu": 1,
+      "run_plaintext": true,
+      "run_encrypted": true,
+      "samples_per_class": 100,
+      "timed_runs": 1000,
+      "warmup_runs": 5,
+      "seed": 42,
+      "weight_cache": "gpu",
+      "activation_split": "train",
+      "activation_samples_per_class": 500,
+      "activation_sample_limit": 960000,
+      "polynomial_coefficients": [
+        -25940.822840822755,
+        15.999999999993772,
+        -34655.849936952196,
+        2.9457002087489395e-13,
+        -8715.02709612943
+      ],
+      "fideslib_coefficients": null,
+      "accuracy_indices": null,
+      "activation_indices": null,
+      "he_parameters": {
+        "ring_dim": 16384,
+        "depth": 11,
+        "scaling_mod_bits": 25,
+        "first_mod_bits": 35
+      }
+    },
+    {
+      "name": "GELU taylor",
+      "model": "emnist/mlp-gelu.json",
+      "method": "taylor",
+      "degree": 6,
+      "range": 32.0,
+      "gpu": 2,
+      "run_plaintext": true,
+      "run_encrypted": true,
+      "samples_per_class": 100,
+      "timed_runs": 1000,
+      "warmup_runs": 5,
+      "seed": 42,
+      "weight_cache": "gpu",
+      "activation_split": "train",
+      "activation_samples_per_class": 500,
+      "activation_sample_limit": 960000,
+      "polynomial_coefficients": [
+        3320629.582072879,
+        16.00000000211892,
+        4985199.7574336,
+        8.267208957174401e-10,
+        1999227.2158520953,
+        -4.538629752220721e-09,
+        334657.0404913777
+      ],
+      "fideslib_coefficients": null,
+      "accuracy_indices": null,
+      "activation_indices": null,
+      "he_parameters": {
+        "ring_dim": 32768,
+        "depth": 13,
+        "scaling_mod_bits": 25,
+        "first_mod_bits": 35
+      }
+    },
+    {
+      "name": "GELU taylor",
+      "model": "emnist/mlp-gelu.json",
+      "method": "taylor",
+      "degree": 8,
+      "range": 32.0,
+      "gpu": 3,
+      "run_plaintext": true,
+      "run_encrypted": true,
+      "samples_per_class": 100,
+      "timed_runs": 1000,
+      "warmup_runs": 5,
+      "seed": 42,
+      "weight_cache": "gpu",
+      "activation_split": "train",
+      "activation_samples_per_class": 500,
+      "activation_sample_limit": 960000,
+      "polynomial_coefficients": [
+        -353646880.27538866,
+        16.000000054510483,
+        -566162816.0145048,
+        -2.2582768840828524e-07,
+        -283574780.6701172,
+        1.2377062243917667e-07,
+        -81257916.64121391,
+        1.481824546827422e-07,
+        -10199071.710213177
+      ],
+      "fideslib_coefficients": null,
+      "accuracy_indices": null,
+      "activation_indices": null,
+      "he_parameters": {
+        "ring_dim": 32768,
+        "depth": 13,
+        "scaling_mod_bits": 25,
+        "first_mod_bits": 35
+      }
+    }
+  ],
+  "created_at": "2026-08-06T07:18:22Z"
+}

@@ -1,0 +1,4 @@
+degree,correct_predictions,total_predictions,accuracy_percent,median_batch_latency_ms,median_latency_ms_per_image,timing_batch_size,warmup_runs,timed_runs,method,interval,model,dataset,activation,device
+2,931,1000,93.1,0.24302152451127768,0.0018986056602443568,128,10,50,chebyshev,17.02488899230957,mlp,mnist,gelu,cuda:0
+4,959,1000,95.9,0.39169786032289267,0.003060139533772599,128,10,50,chebyshev,17.02488899230957,mlp,mnist,gelu,cuda:0
+6,960,1000,96.0,0.5358865018934011,0.0041866132960421965,128,10,50,chebyshev,17.02488899230957,mlp,mnist,gelu,cuda:0
